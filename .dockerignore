@@ -1,0 +1,12 @@
+bin/
+_data/
+*.db
+*.db-wal
+*.db-shm
+secret.key
+web/node_modules/
+web/dist/
+.git/
+.idea/
+.vscode/
+.DS_Store

@@ -1,0 +1,29 @@
+# Go
+/bin/
+*.test
+*.out
+
+# e2e test cache (downloaded Traefik binaries)
+/test/e2e/.cache/
+
+# Local data / runtime
+/_data/
+*.db
+*.db-wal
+*.db-shm
+secret.key
+
+# Frontend
+web/node_modules/
+web/dist/assets/
+web/dist/index.html
+web/coverage/
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# smoke test extracted fixtures (Pebble minica)
+/test/smoke/testdata/
