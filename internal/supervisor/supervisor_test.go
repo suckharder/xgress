@@ -171,6 +171,17 @@ func TestSpawnCapturesLogsAndObservers(t *testing.T) {
 		t.Error("observer never saw the merged JSON warn line")
 	}
 
+	// The raw line is emitted AFTER the warn line, so wait for the observer to
+	// see it before inspecting the ring buffer. consume() calls appendLog before
+	// notifying observers (same goroutine), so once the observer has the line it
+	// is guaranteed to already be in the ring — this avoids a CI flake where the
+	// buffer was read before the raw line had been consumed.
+	if !awaitLine(t, got, func(ll LogLine) bool {
+		return ll.Level == "info" && ll.Message == "not json at all"
+	}) {
+		t.Error("observer never saw the non-JSON raw line")
+	}
+
 	// The ring buffer must hold both the JSON and the non-JSON (raw, level=info) lines.
 	var sawRaw bool
 	for _, ll := range s.Logs(0) {

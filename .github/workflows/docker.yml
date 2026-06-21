@@ -20,6 +20,16 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # web/embed.go does `//go:embed all:dist`, so the SPA must exist before Go
+      # will compile cmd/xgress + web — otherwise the build fails with
+      # "pattern all:dist: no matching files found". Build it first.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - run: npm ci && npm run build
+        working-directory: web
       - uses: actions/setup-go@v5
         with:
           go-version: '1.26'   # matches the Dockerfile builder
