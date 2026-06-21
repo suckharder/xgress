@@ -1,0 +1,43 @@
+# Single-container (managed) deployment (recommended, NPM-style)
+# xgress + Traefik in one container. SQLite by default - no DB needed
+services:
+  xgress:
+    build: .
+    # image: ghcr.io/suckharder/xgress:latest
+    container_name: xgress
+    restart: unless-stopped
+    # --- Hardening (keep):
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - SETUID
+      - SETGID
+      - NET_BIND_SERVICE
+    # ---
+    ports:
+      - "80:80"                  # HTTP
+      - "443:443"                # HTTPS
+      - "127.0.0.1:8088:8088"    # Admin UI
+
+      # Stream hosts (must also declare in XGRESS_STREAM_ENTRYPOINTS) :
+      # - "5432:5432"            # Postgres
+      # - "53:53/udp"            # DNS
+    volumes:
+      - xgress_data:/data
+    environment:
+      # First-run admin is created in the UI. Optionally pre-seed ACME email:
+      XGRESS_ACME_EMAIL: ""
+      XGRESS_ACME_STAGING: "false"
+
+      # Match any "extra" published ports above ("name:port/proto" comma-separated)
+      # Example: XGRESS_STREAM_ENTRYPOINTS: "postgres:5432/tcp,dns:53/udp"
+      XGRESS_STREAM_ENTRYPOINTS: ""
+
+volumes:
+  xgress_data:

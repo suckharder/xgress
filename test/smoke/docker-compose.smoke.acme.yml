@@ -1,0 +1,57 @@
+# Smoke variant: ACME issuance THROUGH THE REAL IMAGE. The xgress container (managed
+# Traefik) points its ACME at a Pebble test CA on the compose network and trusts
+# Pebble's static minica (bind-mounted; the smoke test extracts it from the image).
+# Pebble runs with VA_ALWAYS_VALID=1, so validation is short-circuited (no callback)
+# — this proves the in-container issuance + storage + dynamic TLS-serving pipeline,
+# not the HTTP-01 network round-trip (Tier B covers that). Used only by the smoke test.
+#
+# read_only is intentionally omitted here (vs. the other smoke composes): this is a
+# functional ACME test, not the hardening test (the 8 table variants cover hardening),
+# and it bind-mounts the minica. The privilege drop (cap_drop/non-root) still applies.
+services:
+  xgress:
+    image: xgress:test
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - SETUID
+      - SETGID
+      - NET_BIND_SERVICE
+    ports:
+      - target: 8088       # admin UI + API
+        host_ip: 127.0.0.1
+        protocol: tcp
+      - target: 443        # HTTPS — the ACME-issued leaf is served here
+        host_ip: 127.0.0.1
+        protocol: tcp
+    volumes:
+      - xgress_data:/data
+      # The smoke test extracts Pebble's static minica to ./testdata before `up`.
+      - ./testdata/pebble.minica.pem:/etc/ssl/certs/pebble-minica.pem:ro
+    environment:
+      XGRESS_WAF_PRELOAD: "false"
+      XGRESS_ACME_EMAIL: "ops@smoke.test"
+      XGRESS_ACME_CA_URL: "https://pebble:14000/dir"
+      LEGO_CA_CERTIFICATES: "/etc/ssl/certs/pebble-minica.pem"
+    depends_on:
+      pebble:
+        condition: service_started
+      whoami:
+        condition: service_started
+
+  pebble:
+    image: ghcr.io/letsencrypt/pebble@sha256:ddf230642b1a584f519f32e347de1b05a6e4c1f6c35c1863b33effeab5f78199
+    environment:
+      PEBBLE_VA_ALWAYS_VALID: "1"   # mark challenges valid without connecting back
+      PEBBLE_VA_NOSLEEP: "1"        # no random pre-validation sleep
+      PEBBLE_WFE_NONCEREJECT: "0"   # deterministic: don't reject good nonces
+    # Listens on :14000 (ACME directory) + :15000 (mgmt) on the compose network.
+
+  whoami:
+    image: traefik/whoami@sha256:200689790a0a0ea48ca45992e0450bc26ccab5307375b41c84dfc4f2475937ab
+
+volumes:
+  xgress_data:
