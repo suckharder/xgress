@@ -1,0 +1,56 @@
+# External-Traefik deployment: xgress manages a Traefik it does NOT supervise
+# It serves config + ACME over the network; Traefik polls it by service name
+# Static-config changes (e.g. a new TCP/UDP listener) need a manual traefik restart
+services:
+  xgress:
+    build: .
+    container_name: xgress
+    restart: unless-stopped
+    # --- Hardening (keep):
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - SETUID
+      - SETGID
+      - NET_BIND_SERVICE
+    # ---
+    environment:
+      XGRESS_TRAEFIK_MANAGED: "false"           # don't spawn Traefik
+      XGRESS_PROVIDER_LISTEN: ":9000"            # reachable on the docker network
+      XGRESS_PROVIDER_ADVERTISE: "http://xgress:9000"
+      XGRESS_ADMIN_LISTEN: ":8088"
+      XGRESS_EDGE_LISTEN: ":9100"
+      XGRESS_EDGE_ADVERTISE: "http://xgress:9100"
+    ports:
+      - "127.0.0.1:8088:8088"                # Admin UI
+    volumes:
+      - xgress_data:/data
+      - traefik_static:/data/traefik         # shared static config
+
+  traefik:
+    # Pinned + digest-locked to the supported Traefik (v3.7.5). No plugins are
+    # loaded — the WAF runs in-process inside xgress (WAF hosts are routed to the
+    # token-gated xgress edge), so Traefik needs no catalog access or plugin storage.
+    image: traefik:v3.7.5@sha256:d6858791f9e74df44ca4014166647c41cdc2abd3bf2a71b832ca4e1c6a91b257
+    container_name: traefik
+    restart: unless-stopped
+    depends_on:
+      - xgress
+    command:
+      - "--configFile=/etc/traefik/traefik.yml"
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - traefik_static:/etc/traefik          # reads the static config xgress writes
+      - xgress_data:/data                     # acme material, if any
+
+volumes:
+  xgress_data:
+  traefik_static:

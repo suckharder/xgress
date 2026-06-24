@@ -1,0 +1,39 @@
+# Smoke variant: single-container + Postgres (mirrors docker-compose.postgres.yml).
+# Proves the store migrations + ?→$n rebinder work against real Postgres.
+services:
+  xgress:
+    image: xgress:test
+    read_only: true
+    tmpfs: [/tmp]
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
+    cap_add: [CHOWN, SETUID, SETGID, NET_BIND_SERVICE]
+    ports:
+      - {target: 8088, host_ip: 127.0.0.1, protocol: tcp}
+      - {target: 80, host_ip: 127.0.0.1, protocol: tcp}
+    volumes:
+      - xgress_data:/data
+    environment:
+      XGRESS_DB_DRIVER: "postgres"
+      XGRESS_DB_DSN: "postgres://xgress:xgress@db:5432/xgress?sslmode=disable"
+    depends_on:
+      db: {condition: service_healthy}
+      whoami: {condition: service_started}
+
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: xgress
+      POSTGRES_PASSWORD: xgress
+      POSTGRES_DB: xgress
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U xgress"]
+      interval: 3s
+      timeout: 3s
+      retries: 15
+
+  whoami:
+    image: traefik/whoami@sha256:200689790a0a0ea48ca45992e0450bc26ccab5307375b41c84dfc4f2475937ab
+
+volumes:
+  xgress_data:

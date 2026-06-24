@@ -1,0 +1,50 @@
+# Tier C smoke-test compose — drives the REAL xgress:test image (built by `make smoke`)
+# plus a whoami upstream. Used only by test/smoke/smoke_test.go.
+#
+# The xgress service MIRRORS the hardening in the top-level docker-compose.yml — keep
+# the two in sync. The smoke test greps docker-compose.yml to catch drift, and its
+# behavioral assertions (read-only FS, non-root PID 1, low-port bind) catch any
+# regression in the image regardless of this file.
+#
+# Ports are published on EPHEMERAL host ports (no `published:`), bound to loopback,
+# and discovered at runtime via `docker compose port` — so parallel runs and busy
+# ports never collide.
+services:
+  xgress:
+    image: xgress:test
+    # --- hardening (must match docker-compose.yml) ---
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN              # entrypoint chowns /data
+      - SETUID             # entrypoint drops root -> xgress
+      - SETGID
+      - NET_BIND_SERVICE   # Traefik binds :80/:443 as non-root
+    ports:
+      - target: 8088       # admin UI + API
+        host_ip: 127.0.0.1
+        protocol: tcp
+      - target: 80         # proxied HTTP traffic
+        host_ip: 127.0.0.1
+        protocol: tcp
+      - target: 443        # proxied HTTPS traffic (TLS cert-serving check)
+        host_ip: 127.0.0.1
+        protocol: tcp
+    volumes:
+      - xgress_data:/data
+    # No env needed: the WAF is native + air-gapped (no catalog fetch), and this
+    # variant exercises the proxy loop + hardening, opting no host into the WAF.
+    depends_on:
+      - whoami
+
+  whoami:
+    image: traefik/whoami@sha256:200689790a0a0ea48ca45992e0450bc26ccab5307375b41c84dfc4f2475937ab
+    # Listens on :80 by default; reachable as "whoami" on the compose network.
+
+volumes:
+  xgress_data:
