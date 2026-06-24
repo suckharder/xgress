@@ -135,6 +135,14 @@ func writeStatusPage(w http.ResponseWriter, status int, html string) {
 		html = defaultStatusHTML(status)
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	// Custom error-page / default-site HTML is operator-supplied (trusted), but a
+	// compromised admin or a malicious restored backup could otherwise plant stored
+	// XSS against end-users of proxied hosts. A strict CSP neutralises scripts and
+	// inline event handlers while still allowing the inline styling/images these pages
+	// actually use (S5). No script-src ⇒ scripts fall back to default-src 'none'.
+	w.Header().Set("Content-Security-Policy",
+		"default-src 'none'; style-src 'unsafe-inline'; img-src 'self' data:; font-src 'self' data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.WriteHeader(status)
 	_, _ = w.Write([]byte(html))
 }

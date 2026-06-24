@@ -34,7 +34,7 @@ func newTestAPI(t *testing.T) (*httptest.Server, *store.Store, context.Context) 
 		HTTPPort:         80,
 		HTTPSPort:        443,
 		TraefikStaticCfg: dir + "/traefik.yml", // so SyncStatic (plugins toggle) can write
-		Dev:              true,                  // so the session cookie isn't marked Secure (httptest is plain HTTP)
+		Dev:              true,                 // so the session cookie isn't marked Secure (httptest is plain HTTP)
 	}
 	ctx := context.Background()
 	st, err := store.Open(ctx, cfg)

@@ -105,7 +105,14 @@ func (m *Manager) caURL() string {
 // and registering a new account on first use.
 func (m *Manager) getOrCreateAccount(ctx context.Context, email string) (*user, error) {
 	if email == "" {
-		email = m.defaultEmail
+		// Live value saved via Settings (PUT /api/settings -> "acme.email").
+		// Read at issuance so a freshly-saved email takes effect without a restart.
+		if v, err := m.store.GetSetting(ctx, "acme.email"); err == nil && v != "" {
+			email = v
+		}
+	}
+	if email == "" {
+		email = m.defaultEmail // env XGRESS_ACME_EMAIL (boot default)
 	}
 	if email == "" {
 		return nil, fmt.Errorf("no ACME contact email configured")

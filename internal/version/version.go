@@ -5,7 +5,7 @@ package version
 // These are overridden at build time via -ldflags "-X ...".
 var (
 	// Version is the xgress release version (overridden at build time via -ldflags).
-	Version = "0.9.0-rc.1"
+	Version = "0.10.0"
 	// Commit is the git commit the binary was built from.
 	Commit = "unknown"
 	// Date is the build date in RFC3339.

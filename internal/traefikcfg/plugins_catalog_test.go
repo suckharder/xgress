@@ -8,85 +8,65 @@ import (
 	"github.com/suckharder/xgress/internal/store"
 )
 
-// --- WAF plugin --------------------------------------------------------------
+// --- WAF routing (native, in-edge) -------------------------------------------
 
-func TestDefaultWAFDirectives(t *testing.T) {
-	d := DefaultWAFDirectives()
-	if len(d) == 0 {
-		t.Fatal("default WAF directives must not be empty")
-	}
-	if d[0] != "SecRuleEngine On" {
-		t.Errorf("ruleset must start by enabling the engine, got %q", d[0])
-	}
-	joined := strings.Join(d, "\n")
-	// Sanity: the curated ruleset covers the headline attack classes.
-	for _, want := range []string{"SQL injection", "XSS", "Path traversal", "Scanner user-agent"} {
-		if !strings.Contains(joined, want) {
-			t.Errorf("default ruleset missing a %q rule", want)
-		}
-	}
-}
+const edgeURL = "http://127.0.0.1:9100"
 
-func TestWAFMiddlewareDefaultsAndAudit(t *testing.T) {
-	// Empty directives → falls back to the default ruleset, with audit prepended.
-	mw := wafMiddleware(nil)
-	conf, ok := mw.Plugin[WAFPluginName]
-	if !ok {
-		t.Fatalf("WAF middleware must reference the %q plugin", WAFPluginName)
-	}
-	dirs, ok := conf["directives"].([]string)
-	if !ok || len(dirs) == 0 {
-		t.Fatalf("expected directives slice, got %T", conf["directives"])
-	}
-	if dirs[0] != "SecAuditEngine RelevantOnly" {
-		t.Errorf("audit directives must be first so blocks surface as metrics, got %q", dirs[0])
-	}
-	if !strings.Contains(strings.Join(dirs, "\n"), "SecRuleEngine On") {
-		t.Error("default ruleset not appended after audit directives")
-	}
-
-	// Custom directives → used verbatim after the audit block.
-	custom := wafMiddleware([]string{"SecRuleEngine On", "SecRule ARGS \"@rx custom\" \"id:9001,phase:2,deny\""})
-	cdirs := custom.Plugin[WAFPluginName]["directives"].([]string)
-	if !strings.Contains(strings.Join(cdirs, "\n"), "id:9001") {
-		t.Error("custom directive not present")
-	}
-	if cdirs[0] != "SecAuditEngine RelevantOnly" {
-		t.Error("audit block must precede custom directives")
-	}
-}
-
-func TestRenderWAFAttachedToHost(t *testing.T) {
+func TestRenderWAFHostRoutesToEdge(t *testing.T) {
 	h := &store.Host{
 		ID: "waf1", Kind: store.HostKindProxy, Enabled: true, Domains: []string{"waf.example.com"},
 		Upstreams: []store.Upstream{{Host: "10.0.0.1", Port: 80}}, TLS: store.TLSNone, WAF: true,
 	}
-	res, err := Render(Inputs{Hosts: []*store.Host{h}, WAFEnabled: true, EntryPoints: ep()})
+	res, err := Render(Inputs{Hosts: []*store.Host{h}, WAFEnabled: true, EntryPoints: ep(),
+		CacheBackend: edgeURL, CacheToken: "tok"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := res.Config.HTTP.Middlewares["xgress-waf"]; !ok {
-		t.Fatal("expected shared xgress-waf middleware")
+	// The WAF is no longer a Traefik middleware — it runs in the edge, so the host's
+	// service must point at the edge and carry the edge token middleware.
+	if _, ok := res.Config.HTTP.Middlewares["xgress-waf"]; ok {
+		t.Error("there must be no xgress-waf middleware (the WAF is native, not a plugin)")
+	}
+	svc := res.Config.HTTP.Services["svc-waf1"]
+	if svc == nil || svc.LoadBalancer == nil || len(svc.LoadBalancer.Servers) == 0 || svc.LoadBalancer.Servers[0].URL != edgeURL {
+		t.Fatalf("WAF host service must route to the edge, got %+v", svc)
 	}
 	r := res.Config.HTTP.Routers["host-waf1"]
-	if len(r.Middlewares) == 0 || r.Middlewares[0] != "xgress-waf" {
-		t.Errorf("WAF must be the first (security-gate) middleware, got %v", r.Middlewares)
+	if !contains(r.Middlewares, cacheTokenMW) {
+		t.Errorf("edge-routed host must carry the edge token middleware, got %v", r.Middlewares)
 	}
 	if err := ValidateConfig(res.Config); err != nil {
 		t.Fatalf("validate: %v", err)
 	}
 }
 
-func TestRenderWAFNotAttachedWhenGloballyDisabled(t *testing.T) {
-	// Host wants WAF but the feature is globally off → no WAF middleware/attachment.
+func TestRenderWAFHostDirectWhenGloballyDisabled(t *testing.T) {
+	// Host wants WAF but the feature is globally off → it does NOT route to the edge.
 	h := &store.Host{ID: "waf2", Kind: store.HostKindProxy, Enabled: true, Domains: []string{"w2.example.com"},
 		Upstreams: []store.Upstream{{Host: "10.0.0.1", Port: 80}}, TLS: store.TLSNone, WAF: true}
-	res, _ := Render(Inputs{Hosts: []*store.Host{h}, WAFEnabled: false, EntryPoints: ep()})
-	if _, ok := res.Config.HTTP.Middlewares["xgress-waf"]; ok {
-		t.Error("xgress-waf must not be defined when the WAF feature is disabled")
+	res, _ := Render(Inputs{Hosts: []*store.Host{h}, WAFEnabled: false, EntryPoints: ep(),
+		CacheBackend: edgeURL, CacheToken: "tok"})
+	svc := res.Config.HTTP.Services["svc-waf2"]
+	if svc != nil && svc.LoadBalancer != nil && len(svc.LoadBalancer.Servers) > 0 && svc.LoadBalancer.Servers[0].URL == edgeURL {
+		t.Error("disabled WAF host must not route to the edge")
 	}
-	if contains(res.Config.HTTP.Routers["host-waf2"].Middlewares, "xgress-waf") {
-		t.Error("WAF must not be attached when globally disabled")
+	if contains(res.Config.HTTP.Routers["host-waf2"].Middlewares, cacheTokenMW) {
+		t.Error("edge token must not be attached when the host doesn't route to the edge")
+	}
+}
+
+func TestRenderWAFHostLocationsRoutedThroughEdge(t *testing.T) {
+	// A WAF host with locations must NOT emit a separate direct location router
+	// (which would bypass the WAF) — the edge resolves location backends itself.
+	h := &store.Host{
+		ID: "waf3", Kind: store.HostKindProxy, Enabled: true, Domains: []string{"w3.example.com"},
+		Upstreams: []store.Upstream{{Host: "10.0.0.1", Port: 80}}, TLS: store.TLSNone, WAF: true,
+		Locations: []store.Location{{PathPrefix: "/api", Upstreams: []store.Upstream{{Host: "10.0.0.2", Port: 80}}}},
+	}
+	res, _ := Render(Inputs{Hosts: []*store.Host{h}, WAFEnabled: true, EntryPoints: ep(),
+		CacheBackend: edgeURL, CacheToken: "tok"})
+	if _, ok := res.Config.HTTP.Routers["host-waf3-loc0"]; ok {
+		t.Error("WAF host must not emit a direct location router (would bypass the WAF)")
 	}
 }
 
@@ -127,7 +107,6 @@ func TestRenderStaticStreamEntrypointsAndExtras(t *testing.T) {
 			{Name: "postgres", Port: 5432, Proto: "tcp"},
 			{Name: "dns", Port: 53, Proto: "udp"},
 		},
-		Plugins: []PluginDecl{{Name: WAFPluginName, ModuleName: WAFModuleName, Version: WAFModuleVersion}},
 	}
 	y, err := RenderStatic(p)
 	if err != nil {
@@ -150,8 +129,33 @@ func TestRenderStaticStreamEntrypointsAndExtras(t *testing.T) {
 	if !strings.Contains(s, "prometheus") {
 		t.Error("prometheus metrics block missing")
 	}
-	if !strings.Contains(s, WAFModuleName) || !strings.Contains(s, "experimental") {
-		t.Error("plugin declaration missing")
+	if strings.Contains(s, "experimental") {
+		t.Error("no Traefik plugins should be declared (the WAF is native)")
+	}
+}
+
+func TestRenderStaticMinimal_OmitsExtras(t *testing.T) {
+	// The self-heal minimal config: entrypoints + provider only, no API/metrics/
+	// accessLog/stream entrypoints.
+	y, err := RenderStatic(StaticParams{
+		HTTPEntryPoint: "web", HTTPSEntryPoint: "websecure", HTTPPort: 80, HTTPSPort: 443,
+		ProviderEndpoint: "http://127.0.0.1:9000/api/provider", PollInterval: "1s",
+		APIListen: "127.0.0.1:8099", AccessLog: true, MetricsProm: true,
+		StreamEntryPoints: []config.StreamEntryPoint{{Name: "postgres", Port: 5432, Proto: "tcp"}},
+		Minimal:           true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(y)
+	for _, banned := range []string{"insecure: true", "prometheus", "accessLog", ":5432", "experimental"} {
+		if strings.Contains(s, banned) {
+			t.Errorf("minimal static config must omit %q:\n%s", banned, s)
+		}
+	}
+	// But the essentials must remain.
+	if !strings.Contains(s, "/api/provider") || !strings.Contains(s, ":80") || !strings.Contains(s, ":443") {
+		t.Errorf("minimal static config missing entrypoints/provider:\n%s", s)
 	}
 }
 

@@ -318,71 +318,64 @@ function BackupCard() {
 
 function PluginsCard() {
   const p = useAsync(() => api.getPlugins(), []);
-  const status = useAsync(() => api.traefikStatus(), []);
-  const external = status.data?.managed === false; // external Traefik: xgress can't restart it
   const [waf, setWaf] = React.useState(false);
-  const [ruleset, setRuleset] = React.useState("curated");
+  const [paranoia, setParanoia] = React.useState(1);
+  const [anomaly, setAnomaly] = React.useState(5);
   const [cache, setCache] = React.useState(false);
   const [directives, setDirectives] = React.useState("");
   const [busy, setBusy] = React.useState(false);
   const [msg, setMsg] = React.useState("");
-  const initialWaf = React.useRef(false); // last-saved global WAF enable state
   React.useEffect(() => {
     if (p.data) {
       setWaf(!!p.data.wafEnabled);
-      initialWaf.current = !!p.data.wafEnabled;
-      setRuleset(p.data.wafRuleset || "curated");
+      setParanoia(p.data.wafParanoia || 1);
+      setAnomaly(p.data.wafAnomaly || 5);
       setCache(!!p.data.cacheEnabled);
       setDirectives((p.data.wafDirectives || []).join("\n"));
     }
   }, [p.data]);
   const save = async () => {
     setBusy(true);
-    // Only toggling the global WAF enable/disable restarts Traefik (it loads the
-    // plugin at startup). Ruleset/rule/cache changes are an instant hot-reload.
-    const willRestart = waf !== initialWaf.current;
-    setMsg(willRestart && !external ? "Applying — Traefik restarts to load/unload the WAF plugin…" : "Applying…");
+    // The WAF runs in-process (native Coraza) — every change is an instant
+    // hot-reload; Traefik is never restarted and no plugin is loaded.
+    setMsg("Applying…");
     try {
-      await api.setPlugins({ wafEnabled: waf, wafRuleset: ruleset, cacheEnabled: cache, wafDirectives: directives.split("\n").filter((l) => l.trim()) });
-      initialWaf.current = waf;
-      if (willRestart && external) {
-        setMsg("Saved — restart the external Traefik to load/unload the WAF plugin."); setTimeout(() => setMsg(""), 6000);
-      } else {
-        setMsg("Saved ✓"); setTimeout(() => setMsg(""), 3000);
-      }
+      await api.setPlugins({
+        wafEnabled: waf, wafParanoia: paranoia, wafAnomaly: anomaly, cacheEnabled: cache,
+        wafDirectives: directives.split("\n").filter((l) => l.trim()),
+      });
+      setMsg("Saved ✓"); setTimeout(() => setMsg(""), 3000);
     } catch (e) { setMsg("Failed: " + (e as Error).message); }
     finally { setBusy(false); }
   };
   return (
     <div className="card">
       <div className="card-title" style={{ marginBottom: 10 }}><Icon name="shield" size={16} />WAF &amp; server-side cache</div>
-      <Banner kind="warn">
-        The WAF (Coraza) is <strong>loaded by default</strong> so you can turn it on per host with no extra setup. It’s
-        fetched from the Traefik plugin catalog at startup (needs outbound internet once, then cached on the data
-        volume). Uncheck to disable it everywhere; otherwise just opt in per host in the host editor.{" "}
-        {external
-          ? <>Toggling the global switch rewrites Traefik’s static config — <strong>restart the external Traefik</strong> for it to take effect.</>
-          : <>Toggling the global switch restarts Traefik to load/unload the plugin.</>}
+      <Banner kind="info">
+        The WAF (Coraza + the OWASP Core Rule Set) runs <strong>natively in-process</strong> — it’s compiled into
+        xgress, so there’s no Traefik plugin, no WASM, and no catalog fetch. Enabling it, tuning it, or turning it off
+        is an instant hot-reload (Traefik is never restarted). Opt in per host in the host editor.
       </Banner>
       <label className="check" style={{ marginBottom: 4 }}>
         <input type="checkbox" checked={waf} onChange={(e) => setWaf(e.target.checked)} />
-        <span><strong>WAF — block common exploits</strong> <span className="muted">— loaded &amp; ready (opt in per host) · {p.data?.wafModule}</span></span>
+        <span><strong>WAF — block common exploits</strong> <span className="muted">— native Coraza + OWASP CRS (opt in per host)</span></span>
       </label>
       {waf && (
         <div style={{ margin: "12px 0 4px" }}>
-          <Field label="Ruleset">
-            <select value={ruleset} onChange={(e) => setRuleset(e.target.value)}>
-              <option value="curated">Curated (lightweight, fast)</option>
-              <option value="owasp-crs">OWASP Core Rule Set (bundled, full)</option>
+          <Field label="Paranoia level" help="Higher = stricter rules, more potential false positives. 1 is the CRS default.">
+            <select value={paranoia} onChange={(e) => setParanoia(Number(e.target.value))}>
+              <option value={1}>1 — default (fewest false positives)</option>
+              <option value={2}>2 — stricter</option>
+              <option value={3}>3 — aggressive</option>
+              <option value={4}>4 — maximum</option>
             </select>
           </Field>
-          {ruleset === "owasp-crs"
-            ? <p className="muted" style={{ fontSize: "var(--t-sm)" }}>The full OWASP CRS is bundled into the image and inlined for the WASM plugin (data-file rules resolved to <span className="tag">@pm</span>). More thorough, heavier per request.</p>
-            : (
-              <Field label="WAF rules" help="Coraza seclang, one directive per line.">
-                <textarea className="code" rows={7} value={directives} onChange={(e) => setDirectives(e.target.value)} />
-              </Field>
-            )}
+          <Field label="Anomaly threshold" help="Inbound anomaly score at which a request is blocked (CRS default 5; lower = stricter).">
+            <input type="number" min={1} max={100} value={anomaly} onChange={(e) => setAnomaly(Number(e.target.value))} />
+          </Field>
+          <Field label="Custom rules" help="Optional Coraza seclang, one directive per line — appended after the OWASP CRS.">
+            <textarea className="code" rows={5} value={directives} onChange={(e) => setDirectives(e.target.value)} />
+          </Field>
         </div>
       )}
       <label className="check" style={{ margin: "12px 0 6px" }}>

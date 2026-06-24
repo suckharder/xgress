@@ -14,7 +14,6 @@ services:
     volumes:
       - xgress_data:/data
     environment:
-      XGRESS_WAF_PRELOAD: "false"
       XGRESS_REDIS_URL: "redis:6379"
     depends_on:
       redis: {condition: service_healthy}

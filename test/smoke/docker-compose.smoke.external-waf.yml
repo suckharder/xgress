@@ -1,10 +1,8 @@
-# Smoke variant: WAF through an EXTERNAL Traefik. xgress runs managed=false and declares
-# the Coraza plugin in the static config it writes (XGRESS_WAF_PRELOAD=true); the separate
-# Traefik fetches the WASM plugin from the catalog on boot and persists it under
-# /data/plugins-storage (working_dir: /data) so it's not re-downloaded each restart.
-# Proves WAF *blocking* works in external mode (the rules are inlined into the served
-# config). NOT hermetic — the external Traefik needs outbound internet for the plugin
-# fetch, so the test skips when the plugin catalog is unreachable.
+# Smoke variant: WAF through an EXTERNAL Traefik. xgress runs managed=false; the WAF
+# is the native in-process Coraza engine (OWASP CRS embedded in the binary), so the
+# separate Traefik just routes the WAF-enabled host to the token-gated xgress edge
+# (http://xgress:9100). No Traefik plugin, no catalog fetch — fully hermetic; proves
+# WAF *blocking* works in external mode with no outbound internet.
 services:
   xgress:
     image: xgress:test
@@ -19,7 +17,6 @@ services:
       - xgress_data:/data
       - traefik_static:/data/traefik   # xgress writes traefik.yml here
     environment:
-      XGRESS_WAF_PRELOAD: "true"          # declare the Coraza plugin in the static config
       XGRESS_TRAEFIK_MANAGED: "false"
       XGRESS_PROVIDER_LISTEN: ":9000"
       XGRESS_PROVIDER_ADVERTISE: "http://xgress:9000"
@@ -31,7 +28,6 @@ services:
 
   traefik:
     image: traefik:v3.7.5@sha256:d6858791f9e74df44ca4014166647c41cdc2abd3bf2a71b832ca4e1c6a91b257
-    working_dir: /data                 # persist the fetched Coraza plugin (/data/plugins-storage)
     restart: unless-stopped
     command: ["--configFile=/etc/traefik/traefik.yml"]
     ports:

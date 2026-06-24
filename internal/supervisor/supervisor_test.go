@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -66,6 +67,9 @@ func runFakeTraefik() {
 			_ = os.WriteFile(cfgFile, []byte("x"), 0o600)
 		}
 		os.Exit(3)
+	case "crash-always":
+		// Every invocation exits non-zero immediately — drives the crash-loop guard.
+		os.Exit(7)
 	case "spam":
 		for i := 0; i < 1500; i++ {
 			fmt.Fprintf(os.Stdout, "{\"level\":\"info\",\"message\":\"line-%d\"}\n", i)
@@ -143,6 +147,43 @@ func TestUnmanagedIsInert(t *testing.T) {
 	if err := s.Stop(); err != nil {
 		t.Errorf("Stop (unmanaged) should be nil: %v", err)
 	}
+}
+
+// P0-3: a panicking log observer must not kill the consume goroutine — otherwise
+// the engine's fatal-crash detector dying would silently disable crash detection.
+func TestConsumeIsolatesPanickingObserver(t *testing.T) {
+	s := New(Options{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
+	var goodRan int32
+	s.AddLogObserver(func(LogLine) { panic("observer boom") })
+	s.AddLogObserver(func(LogLine) { atomic.AddInt32(&goodRan, 1) })
+
+	// consume reads to EOF; without panic isolation the first observer's panic would
+	// unwind consume and the second observer would never run (and the goroutine die).
+	s.consume(strings.NewReader("line one\nline two\n"))
+
+	if n := atomic.LoadInt32(&goodRan); n != 2 {
+		t.Errorf("non-panicking observer ran %d times, want 2 (panicking observer must be isolated)", n)
+	}
+}
+
+// P3-12: a panicking OnCrashLoop callback must not crash PID 1. fireCrashLoop runs
+// it in a panic-isolated goroutine; without that, the unrecovered panic would abort
+// the whole process (and this test binary).
+func TestCrashLoopCallbackPanicIsolated(t *testing.T) {
+	fired := make(chan struct{})
+	s := New(Options{
+		Logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+		OnCrashLoop: func() { close(fired); panic("callback boom") },
+	})
+	s.TripCrashLoop()
+	select {
+	case <-fired:
+	case <-time.After(2 * time.Second):
+		t.Fatal("OnCrashLoop never fired")
+	}
+	// Let the goroutine's deferred recover run; if the panic weren't isolated the
+	// process would already be gone.
+	time.Sleep(50 * time.Millisecond)
 }
 
 func TestSpawnCapturesLogsAndObservers(t *testing.T) {
@@ -281,6 +322,48 @@ func TestWatchdogRespawnsAfterCrash(t *testing.T) {
 		return false
 	}) {
 		t.Error("respawned child never logged 'respawned-ok'")
+	}
+}
+
+func TestCrashLoopGuardHaltsRespawnAndFiresCallbackOnce(t *testing.T) {
+	var tripped int32
+	opts := helperOpts(t, "crash-always", time.Second)
+	opts.OnCrashLoop = func() { atomic.AddInt32(&tripped, 1) }
+	s, _ := startManaged(t, opts)
+
+	// 3 unexpected exits within 10s (the watchdog waits ~1s between respawns) trips
+	// the guard, which halts auto-respawn and fires the callback exactly once.
+	if !awaitFunc(t, 14*time.Second, func() bool { return s.Status().CrashLoop }) {
+		t.Fatal("crash-loop guard did not trip")
+	}
+	st := s.Status()
+	if st.Restarts < crashThreshold {
+		t.Errorf("restarts = %d, want >= %d", st.Restarts, crashThreshold)
+	}
+	if got := atomic.LoadInt32(&tripped); got != 1 {
+		t.Errorf("OnCrashLoop fired %d times, want 1", got)
+	}
+	// Confirm respawning has actually stopped (no further crashes/callbacks).
+	time.Sleep(1500 * time.Millisecond)
+	if got := atomic.LoadInt32(&tripped); got != 1 {
+		t.Errorf("OnCrashLoop fired again after trip (now %d) — respawn was not halted", got)
+	}
+}
+
+func TestTripCrashLoopIsSingleFlight(t *testing.T) {
+	var tripped int32
+	opts := helperOpts(t, "longlived", time.Second) // default mode: stays up
+	opts.OnCrashLoop = func() { atomic.AddInt32(&tripped, 1) }
+	s, _ := startManaged(t, opts)
+	waitState(t, s, StateRunning, 3*time.Second)
+
+	s.TripCrashLoop()
+	s.TripCrashLoop() // idempotent — a burst of fatal log lines must fire once
+	if !awaitFunc(t, 2*time.Second, func() bool { return atomic.LoadInt32(&tripped) == 1 }) {
+		t.Fatalf("TripCrashLoop should fire OnCrashLoop once, got %d", atomic.LoadInt32(&tripped))
+	}
+	if !s.Status().CrashLoop {
+		t.Error("TripCrashLoop should set CrashLoop status")
 	}
 }
 

@@ -16,6 +16,7 @@ import (
 	"net"
 	"net/url"
 	"strings"
+	"syscall"
 )
 
 // CheckURL parses raw and rejects it when its host is (or resolves to) a blocked
@@ -64,4 +65,31 @@ func blocked(ip net.IP) bool {
 		ip.IsLinkLocalMulticast() ||
 		ip.IsInterfaceLocalMulticast() ||
 		ip.IsUnspecified()
+}
+
+// CheckAddr rejects a resolved "ip:port" address that points at a blocked IP. Unlike
+// CheckHost (which resolves a hostname at save time), this runs on the ALREADY-RESOLVED
+// address the kernel is about to dial, so it closes the DNS-rebinding / TOCTOU gap: a
+// host that resolves benign at save and later flips to 169.254.169.254/loopback is
+// still blocked at connect time. Use it as a net.Dialer.Control (see DialControl).
+func CheckAddr(address string) error {
+	host, _, err := net.SplitHostPort(address)
+	if err != nil {
+		return fmt.Errorf("invalid dial address %q: %w", address, err)
+	}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		// Control always receives a resolved IP; a non-IP here is unexpected → fail closed.
+		return fmt.Errorf("dial address %q is not a resolved IP", address)
+	}
+	if blocked(ip) {
+		return fmt.Errorf("connection to %s blocked: loopback/link-local/metadata are not permitted", address)
+	}
+	return nil
+}
+
+// DialControl is a net.Dialer.Control hook that enforces the SSRF policy at connect
+// time. Attach it to the dialer used for outbound sinks (notification webhook/SMTP).
+func DialControl(_, address string, _ syscall.RawConn) error {
+	return CheckAddr(address)
 }

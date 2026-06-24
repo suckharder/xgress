@@ -13,7 +13,7 @@ func clearEnv(t *testing.T) {
 		"XGRESS_DATA_DIR", "XGRESS_DB_DRIVER", "XGRESS_DB_DSN", "XGRESS_ADMIN_LISTEN",
 		"XGRESS_PROVIDER_LISTEN", "XGRESS_PROVIDER_ADVERTISE", "XGRESS_PROVIDER_POLL_INTERVAL", "XGRESS_PROVIDER_TOKEN",
 		"XGRESS_TRAEFIK_BINARY", "XGRESS_TRAEFIK_MANAGED", "XGRESS_HTTP_PORT", "XGRESS_HTTPS_PORT",
-		"XGRESS_RESTART_DRAIN", "XGRESS_TRAEFIK_API_LISTEN", "XGRESS_WAF_CRS_FILE", "XGRESS_WAF_PRELOAD",
+		"XGRESS_RESTART_DRAIN", "XGRESS_TRAEFIK_API_LISTEN", "XGRESS_WAF_DEFAULT", "XGRESS_ADMIN_INSECURE_COOKIE",
 		"XGRESS_REDIS_URL", "XGRESS_EDGE_LISTEN", "XGRESS_EDGE_ADVERTISE", "XGRESS_CACHE_TTL",
 		"XGRESS_EXTERNAL_CERTS_DIR", "XGRESS_ACME_EMAIL", "XGRESS_ACME_STAGING", "XGRESS_ACME_CA_URL", "XGRESS_ACME_DNS_RESOLVERS",
 		"XGRESS_RENEWAL_INTERVAL", "XGRESS_RENEWAL_LEASE_TTL",
@@ -45,8 +45,11 @@ func TestLoadDefaults(t *testing.T) {
 	if !c.TraefikManaged {
 		t.Error("TraefikManaged should default true")
 	}
-	if !c.WAFPreload {
-		t.Error("WAFPreload should default true")
+	if !c.WAFDefaultEnabled {
+		t.Error("WAFDefaultEnabled should default true")
+	}
+	if c.AdminInsecureCookie {
+		t.Error("AdminInsecureCookie should default false")
 	}
 	if c.HTTPPort != 80 || c.HTTPSPort != 443 {
 		t.Errorf("ports = %d/%d, want 80/443", c.HTTPPort, c.HTTPSPort)
@@ -81,7 +84,8 @@ func TestLoadEnvOverrides(t *testing.T) {
 	t.Setenv("XGRESS_DATA_DIR", "/srv/xgress")
 	t.Setenv("XGRESS_ADMIN_LISTEN", "127.0.0.1:9999")
 	t.Setenv("XGRESS_TRAEFIK_MANAGED", "false")
-	t.Setenv("XGRESS_WAF_PRELOAD", "false")
+	t.Setenv("XGRESS_WAF_DEFAULT", "false")
+	t.Setenv("XGRESS_ADMIN_INSECURE_COOKIE", "true")
 	t.Setenv("XGRESS_HTTP_PORT", "8080")
 	t.Setenv("XGRESS_PROVIDER_POLL_INTERVAL", "5s")
 	t.Setenv("XGRESS_CACHE_TTL", "30s")
@@ -104,8 +108,11 @@ func TestLoadEnvOverrides(t *testing.T) {
 	if c.TraefikManaged {
 		t.Error("TraefikManaged should be false")
 	}
-	if c.WAFPreload {
-		t.Error("WAFPreload should be false")
+	if c.WAFDefaultEnabled {
+		t.Error("WAFDefaultEnabled should be false")
+	}
+	if !c.AdminInsecureCookie {
+		t.Error("AdminInsecureCookie should be true when XGRESS_ADMIN_INSECURE_COOKIE=true")
 	}
 	if c.HTTPPort != 8080 {
 		t.Errorf("HTTPPort = %d", c.HTTPPort)

@@ -200,6 +200,8 @@ export interface TraefikStatus {
   startedAt: string;
   lastError?: string;
   managed: boolean;
+  crashLoop?: boolean;
+  restarts?: number;
 }
 
 export interface LogLine {

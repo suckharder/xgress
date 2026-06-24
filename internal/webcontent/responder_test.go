@@ -33,6 +33,24 @@ func serve(r *Responder, method, target string) *http.Response {
 	return rec.Result()
 }
 
+// S5: served status/error-page HTML carries a strict CSP that neutralises scripts
+// (and nosniff), so operator-supplied custom HTML can't become stored XSS.
+func TestStatusPageStrictCSP(t *testing.T) {
+	rec := httptest.NewRecorder()
+	writeStatusPage(rec, http.StatusNotFound, `<img src=x onerror=alert(1)><script>alert(2)</script>`)
+
+	csp := rec.Header().Get("Content-Security-Policy")
+	if !strings.Contains(csp, "default-src 'none'") {
+		t.Errorf("status page missing strict CSP, got %q", csp)
+	}
+	if strings.Contains(csp, "script-src") {
+		t.Errorf("CSP must not grant a script-src (scripts fall back to default-src 'none'): %q", csp)
+	}
+	if rec.Header().Get("X-Content-Type-Options") != "nosniff" {
+		t.Error("status page missing X-Content-Type-Options: nosniff")
+	}
+}
+
 func TestBannedReturns403(t *testing.T) {
 	r, _, _ := newResponder(t)
 	resp := serve(r, "GET", BannedPath)

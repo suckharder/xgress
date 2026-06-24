@@ -14,7 +14,6 @@ services:
       - xgress_data:/data
       - traefik_static:/data/traefik
     environment:
-      XGRESS_WAF_PRELOAD: "false"
       XGRESS_TRAEFIK_MANAGED: "false"
       XGRESS_PROVIDER_LISTEN: ":9000"
       XGRESS_PROVIDER_ADVERTISE: "http://xgress:9000"

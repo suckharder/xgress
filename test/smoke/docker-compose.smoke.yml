@@ -37,10 +37,8 @@ services:
         protocol: tcp
     volumes:
       - xgress_data:/data
-    environment:
-      # The smoke test exercises the proxy loop + hardening, not the WAF. Disabling
-      # the preload avoids a startup catalog fetch (network) so the test is hermetic.
-      XGRESS_WAF_PRELOAD: "false"
+    # No env needed: the WAF is native + air-gapped (no catalog fetch), and this
+    # variant exercises the proxy loop + hardening, opting no host into the WAF.
     depends_on:
       - whoami
 

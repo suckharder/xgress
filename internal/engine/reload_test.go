@@ -52,6 +52,63 @@ func TestReloadRendersHostAndSnapshots(t *testing.T) {
 	}
 }
 
+// P1-8: a reload that re-renders a byte-identical config must NOT write a new
+// snapshot or bump the served version.
+func TestReloadSkipsSnapshotWhenUnchanged(t *testing.T) {
+	e := newTestEngine(t)
+	ctx := context.Background()
+
+	h := &store.Host{
+		Kind: store.HostKindProxy, Enabled: true,
+		Domains:   []string{"a.example.com"},
+		Upstreams: []store.Upstream{{Scheme: "http", Host: "10.0.0.5", Port: 8080}},
+		TLS:       store.TLSNone,
+	}
+	if err := e.st.CreateHost(ctx, h); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.Reload(ctx); err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	v1 := e.Version()
+
+	// Reload again with no DB change → no version bump, no new snapshot row.
+	if _, err := e.Reload(ctx); err != nil {
+		t.Fatalf("second reload: %v", err)
+	}
+	if e.Version() != v1 {
+		t.Errorf("version bumped on an unchanged reload: %d -> %d", v1, e.Version())
+	}
+	latest, err := e.st.LatestSnapshotVersion(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if latest != v1 {
+		t.Errorf("a snapshot was written for an unchanged reload: latest=%d, want %d", latest, v1)
+	}
+}
+
+// P1-5: RenderedHash() (the cheap pre-decrypt 304 check) must equal the etag that
+// ProviderDocument returns for the same served config — otherwise the fast-path
+// would 304 (or fail to) inconsistently with the real document.
+func TestRenderedHashMatchesProviderEtag(t *testing.T) {
+	e := newTestEngine(t)
+	if h := e.RenderedHash(); h != "empty" {
+		t.Errorf("RenderedHash before first render = %q, want \"empty\"", h)
+	}
+	ctx := context.Background()
+	if _, err := e.Reload(ctx); err != nil {
+		t.Fatal(err)
+	}
+	_, etag, err := e.ProviderDocument(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if h := e.RenderedHash(); h != etag {
+		t.Errorf("RenderedHash %q != ProviderDocument etag %q", h, etag)
+	}
+}
+
 func TestProviderDocumentValidJSON(t *testing.T) {
 	e := newTestEngine(t)
 	ctx := context.Background()

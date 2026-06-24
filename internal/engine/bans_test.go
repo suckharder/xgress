@@ -43,6 +43,74 @@ func newTestEngine(t *testing.T) *Engine {
 	return e
 }
 
+// P1-7: BanConfig is cached so the hot WAF-block path doesn't read 4 settings per
+// event; SetBanConfig must refresh that cache immediately.
+func TestBanConfigCachedAndRefreshedOnSet(t *testing.T) {
+	e := newTestEngine(t)
+	ctx := context.Background()
+
+	if c := e.BanConfig(ctx); c.Enabled {
+		t.Fatal("auto-ban should default to disabled")
+	}
+	if e.banConfig.Load() == nil {
+		t.Error("reading BanConfig should populate the cache")
+	}
+
+	if err := e.SetBanConfig(ctx, BanConfig{Enabled: true, Threshold: 3, WindowSec: 60, DurationSec: 120}); err != nil {
+		t.Fatalf("SetBanConfig: %v", err)
+	}
+	c := e.BanConfig(ctx)
+	if !c.Enabled || c.Threshold != 3 || c.WindowSec != 60 || c.DurationSec != 120 {
+		t.Errorf("cache not refreshed after SetBanConfig: %+v", c)
+	}
+	// The cached value must match a fresh DB load (cache stays consistent).
+	if got := e.loadBanConfig(ctx); got != c {
+		t.Errorf("cached %+v != DB %+v", c, got)
+	}
+}
+
+// S3: a WAF engine build failure is tracked (and surfaced on /api/health) instead of
+// silently leaving WAF hosts uninspected. recordWAFStatus drives the status + alert.
+func TestWAFStatusTracking(t *testing.T) {
+	e := newTestEngine(t)
+	ctx := context.Background()
+
+	if !e.WAFStatus().Healthy {
+		t.Fatal("WAF status should start healthy")
+	}
+	e.recordWAFStatus(ctx, false, "bad seclang directive")
+	if s := e.WAFStatus(); s.Healthy || s.Error != "bad seclang directive" {
+		t.Errorf("after build failure = %+v, want unhealthy with the error", s)
+	}
+	e.recordWAFStatus(ctx, true, "")
+	if s := e.WAFStatus(); !s.Healthy || s.Error != "" {
+		t.Errorf("after recovery = %+v, want healthy", s)
+	}
+}
+
+// P1-7: the preloaded-settings bool helper matches settingBool's semantics
+// (absent key → default; present-but-empty → false).
+func TestSettingBoolMap(t *testing.T) {
+	m := map[string]string{"on": "true", "off": "false", "one": "1", "empty": ""}
+	cases := []struct {
+		key  string
+		def  bool
+		want bool
+	}{
+		{"on", false, true},
+		{"off", true, false},
+		{"one", false, true},
+		{"empty", true, false}, // present-but-empty parses false, not the default
+		{"absent", true, true}, // missing key falls back to the default
+		{"absent", false, false},
+	}
+	for _, tc := range cases {
+		if got := settingBoolMap(m, tc.key, tc.def); got != tc.want {
+			t.Errorf("settingBoolMap(%q, def=%v) = %v, want %v", tc.key, tc.def, got, tc.want)
+		}
+	}
+}
+
 func TestAutoBanWindow(t *testing.T) {
 	e := newTestEngine(t)
 	ctx := context.Background()

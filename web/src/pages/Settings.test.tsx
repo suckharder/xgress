@@ -65,33 +65,37 @@ describe("Settings — Traefik engine card (external mode)", () => {
 });
 
 describe("Settings — WAF/cache plugins card", () => {
-  it("saving with a changed global WAF toggle signals a Traefik restart (managed)", async () => {
+  it("enabling the WAF saves and hot-reloads (no Traefik restart) with paranoia/anomaly", async () => {
     server.use(
       http.get("/api/traefik/status", () => HttpResponse.json(makeTraefikStatus({ managed: true }))),
-      http.get("/api/plugins", () => HttpResponse.json({ wafEnabled: false, wafRuleset: "curated", cacheEnabled: false, wafModule: "coraza", cacheBackend: "memory" })),
+      http.get("/api/plugins", () => HttpResponse.json({ wafEnabled: false, wafParanoia: 1, wafAnomaly: 5, wafDirectives: [], cacheEnabled: false, cacheBackend: "memory" })),
     );
     let body: any;
     server.use(http.put("/api/plugins", async ({ request }) => { body = await request.json(); return new HttpResponse(null, { status: 204 }); }));
     render(<Settings user={makeUser({ role: "admin" })} />);
     const wafToggle = await screen.findByRole("checkbox", { name: /WAF — block common exploits/ });
     await userEvent.click(wafToggle); // flip from disabled → enabled
+    // The native WAF exposes paranoia + anomaly controls (not a curated/CRS selector).
+    expect(await screen.findByText(/Paranoia level/)).toBeInTheDocument();
     await userEvent.click(wafCard().getByRole("button", { name: "Save & apply" }));
     await waitFor(() => expect(body).toBeTruthy());
     expect(body.wafEnabled).toBe(true);
+    expect(body.wafParanoia).toBe(1);
+    expect(body.wafAnomaly).toBe(5);
     expect(await screen.findByText("Saved ✓")).toBeInTheDocument();
   });
 
-  it("external mode tells the operator to restart the external Traefik after a WAF flip", async () => {
+  it("works the same in external mode — the WAF is in-process, so no restart prompt", async () => {
     server.use(
       http.get("/api/traefik/status", () => HttpResponse.json(makeTraefikStatus({ managed: false }))),
-      http.get("/api/plugins", () => HttpResponse.json({ wafEnabled: false, wafRuleset: "curated", cacheEnabled: false, cacheBackend: "memory" })),
+      http.get("/api/plugins", () => HttpResponse.json({ wafEnabled: false, wafParanoia: 1, wafAnomaly: 5, wafDirectives: [], cacheEnabled: false, cacheBackend: "memory" })),
       http.put("/api/plugins", () => new HttpResponse(null, { status: 204 })),
     );
     render(<Settings user={makeUser({ role: "admin" })} />);
     const wafToggle = await screen.findByRole("checkbox", { name: /WAF — block common exploits/ });
     await userEvent.click(wafToggle);
     await userEvent.click(wafCard().getByRole("button", { name: "Save & apply" }));
-    expect(await screen.findByText(/^Saved — restart the external Traefik/)).toBeInTheDocument();
+    expect(await screen.findByText("Saved ✓")).toBeInTheDocument();
   });
 });
 

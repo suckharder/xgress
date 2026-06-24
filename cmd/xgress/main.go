@@ -84,6 +84,22 @@ func run(log *slog.Logger) error {
 		return fmt.Errorf("edge token: %w", err)
 	}
 
+	// External-Traefik mode binds the provider + edge on the Docker network, so a
+	// missing token would expose the decrypted-key endpoint / cache as an open proxy.
+	// Tokens always auto-generate above, but enforce the invariant fail-closed (S2).
+	if !cfg.TraefikManaged {
+		if cfg.ProviderToken == "" || cfg.EdgeToken == "" {
+			return fmt.Errorf("external-Traefik mode requires non-empty provider and edge tokens; set XGRESS_PROVIDER_TOKEN / XGRESS_EDGE_TOKEN (or let them auto-generate) — refusing to start with an ungated key endpoint")
+		}
+		// S1 mitigation: the provider serves decrypted TLS private keys, and both the
+		// provider and edge listen over PLAINTEXT HTTP on the Docker network here —
+		// protected only by the bearer token, not TLS. Warn so the operator keeps that
+		// network trusted (a private overlay, not a shared bridge) and the tokens
+		// secret. See docs/operations/trust-model.md.
+		log.Warn("external-Traefik mode: the provider (which inlines decrypted TLS private keys) and the cache edge are served over PLAINTEXT HTTP on the Docker network, authenticated only by a bearer token — not TLS. Keep this network private and the tokens secret; see the trust-model docs.",
+			"provider", cfg.ProviderListen, "edge", cfg.EdgeListen)
+	}
+
 	st, err := store.Open(ctx, cfg)
 	if err != nil {
 		return err
@@ -132,9 +148,14 @@ func run(log *slog.Logger) error {
 		cacheStore = rs
 		log.Info("server-side cache: redis", "url", cfg.RedisURL)
 	} else {
-		cacheStore = edge.NewMemStore()
+		cacheStore = edge.NewMemStore(ctx, edge.MemLimits{
+			MaxBytes:      cfg.CacheMaxBytes,
+			MaxEntryBytes: cfg.CacheMaxEntryBytes,
+		})
 	}
 	cacheEdge := edge.New(cacheStore, cfg.CacheTTL, cfg.EdgeToken, log)
+	cacheEdge.SetEntryLimit(cfg.CacheMaxEntryBytes)
+	cacheEdge.SetWAFResponseFailClosed(cfg.WAFResponseFailClosed)
 	eng.SetCacheEdge(cacheEdge, cfg.EdgeAdvertise, cfg.EdgeToken)
 
 	assets, err := web.Assets()

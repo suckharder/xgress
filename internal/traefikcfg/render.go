@@ -59,11 +59,10 @@ type Inputs struct {
 	// into the rendered output (the "raw passthrough" advanced feature).
 	RawConfig *dynamic.Configuration
 
-	// Plugin toggles (Round 2). When enabled, the corresponding plugin middleware
-	// is defined and attachable by hosts. The plugin must also be declared in
-	// static config (see StaticParams.Plugins).
-	WAFEnabled    bool
-	WAFDirectives []string
+	// WAFEnabled is the global WAF feature toggle. When on, WAF-enabled hosts
+	// (h.WAF) are routed through the edge, which runs the native Coraza engine
+	// in-process. The WAF is no longer a Traefik plugin.
+	WAFEnabled bool
 
 	// CacheEnabled turns on xgress's native server-side cache; CacheBackend is the
 	// URL of the cache edge. Cache-enabled hosts route their service to the edge,
@@ -168,14 +167,11 @@ func Render(in Inputs) (*Result, error) {
 		}
 	}
 
-	// WAF plugin middleware (defined once; hosts attach it via the toggle).
-	if in.WAFEnabled {
-		cfg.HTTP.Middlewares["xgress-waf"] = wafMiddleware(in.WAFDirectives)
-	}
-
-	// Cache-edge auth middleware (defined once; cache-routed hosts attach it). It adds
-	// the token header so only Traefik can reach the network-exposed edge.
-	if in.CacheEnabled && in.CacheBackend != "" && in.CacheToken != "" {
+	// Edge auth middleware (defined once; hosts routed to the edge attach it). It
+	// adds the token header so only Traefik can reach the network-exposed edge. The
+	// native WAF runs in the edge (not a Traefik plugin), so WAF-enabled hosts route
+	// here too — hence the gate covers both the cache and WAF features.
+	if in.CacheBackend != "" && in.CacheToken != "" && (in.CacheEnabled || in.WAFEnabled) {
 		cfg.HTTP.Middlewares[cacheTokenMW] = &dynamic.Middleware{
 			Headers: &dynamic.Headers{CustomRequestHeaders: map[string]string{config.EdgeTokenHeader: in.CacheToken}},
 		}
@@ -370,13 +366,24 @@ func buildServersLB(h *store.Host, upstreams []store.Upstream) *dynamic.ServersL
 // mode it's one ServersLoadBalancer; the composition modes (weighted/canary,
 // failover, mirroring) build a leaf service per backend group plus a composed
 // service that references them.
-func buildHostService(cfg *dynamic.Configuration, h *store.Host, cacheEnabled bool, cacheBackend string) {
+// routesToEdge reports whether a host's traffic should be routed to the xgress
+// edge (which runs the native WAF and/or the server-side cache). Requires the
+// edge backend URL to be configured.
+func routesToEdge(h *store.Host, in Inputs) bool {
+	if in.CacheBackend == "" {
+		return false
+	}
+	return (h.WAF && in.WAFEnabled) || (h.Cache && in.CacheEnabled)
+}
+
+func buildHostService(cfg *dynamic.Configuration, h *store.Host, in Inputs) {
 	svcName := "svc-" + h.ID
-	// Cache-enabled hosts route to xgress's cache edge, which caches GET responses
-	// and reverse-proxies to the real backend (which it resolves itself).
-	if h.Cache && cacheEnabled && cacheBackend != "" {
+	// Hosts with WAF and/or cache enabled route to xgress's edge, which runs the
+	// native Coraza WAF, caches GET responses, and reverse-proxies to the real
+	// backend (which it resolves itself).
+	if routesToEdge(h, in) {
 		cfg.HTTP.Services[svcName] = &dynamic.Service{LoadBalancer: &dynamic.ServersLoadBalancer{
-			Servers:        []dynamic.Server{{URL: cacheBackend}},
+			Servers:        []dynamic.Server{{URL: in.CacheBackend}},
 			PassHostHeader: ptr.To(true),
 		}}
 		return
@@ -434,14 +441,12 @@ func renderProxyHost(cfg *dynamic.Configuration, h *store.Host, mwByID map[strin
 	svcName := "svc-" + h.ID
 	routerName := "host-" + h.ID
 
-	buildHostService(cfg, h, in.CacheEnabled, in.CacheBackend)
+	buildHostService(cfg, h, in)
 
-	// Middleware chain: WAF (security gate) first, then access lists (auth/IP),
-	// then per-host generated (HSTS), error pages, user middlewares, then cache.
+	// Middleware chain: access lists (auth/IP), then per-host generated (HSTS),
+	// error pages, then user middlewares. The WAF is no longer a Traefik middleware
+	// — it runs in-process in the edge, which WAF-enabled hosts are routed to.
 	var mws []string
-	if h.WAF && in.WAFEnabled {
-		mws = append(mws, "xgress-waf")
-	}
 	mws = append(mws, accessListMiddlewares(h, aclByID)...)
 	mws = append(mws, collectMiddlewareNames(cfg, h, mwByID)...)
 	if epName := errorPagesMiddleware(cfg, h, in.ContentBackend); epName != "" {
@@ -449,12 +454,12 @@ func renderProxyHost(cfg *dynamic.Configuration, h *store.Host, mwByID map[strin
 	}
 	mws = append(mws, perHostRawMiddlewares(cfg, h)...)
 
-	// Cache-routed hosts go through the edge, which is token-gated when network-exposed.
+	// Edge-routed hosts go through the edge, which is token-gated when network-exposed.
 	// Inject the token middleware on routers that target the edge (main, static-asset,
 	// satisfy-any bypass) — but NOT location routers, which have their own non-edge
 	// services (so locMwsBase, the pre-token chain, is used for those).
 	locMwsBase := mws
-	if h.Cache && in.CacheEnabled && in.CacheBackend != "" && in.CacheToken != "" {
+	if routesToEdge(h, in) && in.CacheToken != "" {
 		mws = append(append([]string{}, mws...), cacheTokenMW)
 	}
 
@@ -505,9 +510,11 @@ func renderProxyHost(cfg *dynamic.Configuration, h *store.Host, mwByID map[strin
 	}
 
 	// Path-scoped locations: each gets a higher-priority router (host rule +
-	// PathPrefix) and its own service.
+	// PathPrefix) and its own service — EXCEPT on WAF-enabled hosts, where every
+	// path is routed through the edge (which resolves the location backend and
+	// strip-prefix itself), so locations don't bypass the WAF.
 	for i, loc := range h.Locations {
-		if loc.PathPrefix == "" || len(loc.Upstreams) == 0 {
+		if (h.WAF && in.WAFEnabled) || loc.PathPrefix == "" || len(loc.Upstreams) == 0 {
 			continue
 		}
 		locSvc := fmt.Sprintf("svc-%s-loc%d", h.ID, i)

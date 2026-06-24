@@ -112,15 +112,18 @@ type Config struct {
 	// import. Loopback-only; never world-reachable. Empty disables it.
 	TraefikAPIListen string
 
-	// WAFCRSFile is the path to the build-time-bundled OWASP CRS directives file
-	// (produced by tools/crsbundle). Used when a host's WAF ruleset is "owasp-crs".
-	WAFCRSFile string
+	// WAFDefaultEnabled is the default for the global WAF feature when the
+	// plugins.waf.enabled setting is unset. The native Coraza engine + OWASP CRS are
+	// always compiled into the binary (no plugin, no catalog fetch), so this is just
+	// an on/off default; hosts still opt in individually via h.WAF. Defaults true.
+	WAFDefaultEnabled bool
 
-	// WAFPreload makes the Coraza WAF plugin load by default (opt-out): when the
-	// plugins.waf.enabled setting is unset, this is used. The plugin is then
-	// declared in static config and fetched at startup (needs outbound internet
-	// once); hosts still opt in individually. Set false for air-gapped installs.
-	WAFPreload bool
+	// WAFResponseFailClosed controls the WAF response phase on a Coraza processing
+	// error. Default false keeps the request served (fail-open) — a WAF internal error
+	// shouldn't 500 a legitimate response. Set true to fail closed (block with 500) for
+	// hosts where an uninspected response is unacceptable. The request phase always
+	// fails closed. (S4)
+	WAFResponseFailClosed bool
 
 	// RedisURL, when set, is the address of a Redis server backing the server-side
 	// HTTP cache (shared across instances). Empty = in-memory cache.
@@ -140,6 +143,15 @@ type Config struct {
 
 	// CacheTTL is the default server-side cache TTL when a response has no max-age.
 	CacheTTL time.Duration
+
+	// CacheMaxBytes bounds the total size of the in-memory cache (LRU eviction); a
+	// distinct-URL flood can otherwise grow it without bound and OOM-kill PID 1.
+	// CacheMaxEntryBytes is the per-entry ceiling: larger responses are streamed
+	// (never buffered/cached). Both also cap how much of a response the edge buffers
+	// for caching/WAF inspection. Ignored for the Redis backend (externally bounded).
+	// Accept a plain byte count or a KB/MB/GB suffix (e.g. "256MB").
+	CacheMaxBytes      int64
+	CacheMaxEntryBytes int64
 
 	// ExternalCertsDir, when set, is a directory of externally-managed TLS
 	// certificates (e.g. written by cert-manager). xgress scans it for *.crt/*.key
@@ -174,42 +186,51 @@ type Config struct {
 	// Dev disables some production guards (e.g. secure-cookie enforcement) for
 	// local development over plain HTTP.
 	Dev bool
+
+	// AdminInsecureCookie omits the Secure attribute on the admin session cookie so
+	// the admin UI can authenticate over plain HTTP (admin exposed without TLS, or a
+	// trusted LAN). Unlike Dev it changes NOTHING else. Off by default; only use
+	// behind TLS or on a trusted network.
+	AdminInsecureCookie bool
 }
 
 // Load resolves configuration from environment variables, applying defaults.
 func Load() (*Config, error) {
 	c := &Config{
-		DataDir:              env("XGRESS_DATA_DIR", "/data"),
-		DBDriver:             DBDriver(env("XGRESS_DB_DRIVER", string(DriverSQLite))),
-		DBDSN:                env("XGRESS_DB_DSN", ""),
-		AdminListen:          env("XGRESS_ADMIN_LISTEN", "127.0.0.1:8088"),
-		ProviderListen:       env("XGRESS_PROVIDER_LISTEN", "127.0.0.1:9000"),
-		ProviderAdvertise:    env("XGRESS_PROVIDER_ADVERTISE", ""),
-		ProviderPollInterval: envDuration("XGRESS_PROVIDER_POLL_INTERVAL", time.Second),
-		ProviderToken:        env("XGRESS_PROVIDER_TOKEN", ""),
-		TraefikBinary:        env("XGRESS_TRAEFIK_BINARY", "traefik"),
-		TraefikManaged:       envBool("XGRESS_TRAEFIK_MANAGED", true),
-		HTTPEntryPoint:       "web",
-		HTTPSEntryPoint:      "websecure",
-		HTTPPort:             envInt("XGRESS_HTTP_PORT", 80),
-		HTTPSPort:            envInt("XGRESS_HTTPS_PORT", 443),
-		RestartDrain:         envDuration("XGRESS_RESTART_DRAIN", 10*time.Second),
-		TraefikAPIListen:     env("XGRESS_TRAEFIK_API_LISTEN", "127.0.0.1:8099"),
-		WAFCRSFile:           env("XGRESS_WAF_CRS_FILE", "/etc/coraza-crs/crs-bundled.conf"),
-		WAFPreload:           envBool("XGRESS_WAF_PRELOAD", true),
-		RedisURL:             env("XGRESS_REDIS_URL", ""),
-		EdgeListen:           env("XGRESS_EDGE_LISTEN", "127.0.0.1:9100"),
-		EdgeAdvertise:        env("XGRESS_EDGE_ADVERTISE", ""),
-		EdgeToken:            env("XGRESS_EDGE_TOKEN", ""),
-		CacheTTL:             envDuration("XGRESS_CACHE_TTL", 2*time.Minute),
-		ExternalCertsDir:     env("XGRESS_EXTERNAL_CERTS_DIR", ""),
-		ACMEEmail:            env("XGRESS_ACME_EMAIL", ""),
-		ACMEStaging:          envBool("XGRESS_ACME_STAGING", false),
-		ACMECAURL:            env("XGRESS_ACME_CA_URL", ""),
-		ACMEDNSResolvers:     splitCSV(env("XGRESS_ACME_DNS_RESOLVERS", "")),
-		RenewalInterval:      envDuration("XGRESS_RENEWAL_INTERVAL", 12*time.Hour),
-		RenewalLeaseTTL:      envDuration("XGRESS_RENEWAL_LEASE_TTL", 15*time.Minute),
-		Dev:                  envBool("XGRESS_DEV", false),
+		DataDir:               env("XGRESS_DATA_DIR", "/data"),
+		DBDriver:              DBDriver(env("XGRESS_DB_DRIVER", string(DriverSQLite))),
+		DBDSN:                 env("XGRESS_DB_DSN", ""),
+		AdminListen:           env("XGRESS_ADMIN_LISTEN", "127.0.0.1:8088"),
+		ProviderListen:        env("XGRESS_PROVIDER_LISTEN", "127.0.0.1:9000"),
+		ProviderAdvertise:     env("XGRESS_PROVIDER_ADVERTISE", ""),
+		ProviderPollInterval:  envDuration("XGRESS_PROVIDER_POLL_INTERVAL", time.Second),
+		ProviderToken:         env("XGRESS_PROVIDER_TOKEN", ""),
+		TraefikBinary:         env("XGRESS_TRAEFIK_BINARY", "traefik"),
+		TraefikManaged:        envBool("XGRESS_TRAEFIK_MANAGED", true),
+		HTTPEntryPoint:        "web",
+		HTTPSEntryPoint:       "websecure",
+		HTTPPort:              envInt("XGRESS_HTTP_PORT", 80),
+		HTTPSPort:             envInt("XGRESS_HTTPS_PORT", 443),
+		RestartDrain:          envDuration("XGRESS_RESTART_DRAIN", 10*time.Second),
+		TraefikAPIListen:      env("XGRESS_TRAEFIK_API_LISTEN", "127.0.0.1:8099"),
+		WAFDefaultEnabled:     envBool("XGRESS_WAF_DEFAULT", true),
+		WAFResponseFailClosed: envBool("XGRESS_WAF_RESPONSE_FAIL_CLOSED", false),
+		RedisURL:              env("XGRESS_REDIS_URL", ""),
+		EdgeListen:            env("XGRESS_EDGE_LISTEN", "127.0.0.1:9100"),
+		EdgeAdvertise:         env("XGRESS_EDGE_ADVERTISE", ""),
+		EdgeToken:             env("XGRESS_EDGE_TOKEN", ""),
+		CacheTTL:              envDuration("XGRESS_CACHE_TTL", 2*time.Minute),
+		CacheMaxBytes:         envBytes("XGRESS_CACHE_MAX_BYTES", 128<<20),
+		CacheMaxEntryBytes:    envBytes("XGRESS_CACHE_MAX_ENTRY_BYTES", 8<<20),
+		ExternalCertsDir:      env("XGRESS_EXTERNAL_CERTS_DIR", ""),
+		ACMEEmail:             env("XGRESS_ACME_EMAIL", ""),
+		ACMEStaging:           envBool("XGRESS_ACME_STAGING", false),
+		ACMECAURL:             env("XGRESS_ACME_CA_URL", ""),
+		ACMEDNSResolvers:      splitCSV(env("XGRESS_ACME_DNS_RESOLVERS", "")),
+		RenewalInterval:       envDuration("XGRESS_RENEWAL_INTERVAL", 12*time.Hour),
+		RenewalLeaseTTL:       envDuration("XGRESS_RENEWAL_LEASE_TTL", 15*time.Minute),
+		Dev:                   envBool("XGRESS_DEV", false),
+		AdminInsecureCookie:   envBool("XGRESS_ADMIN_INSECURE_COOKIE", false),
 	}
 
 	eps, err := parseStreamEntryPoints(env("XGRESS_STREAM_ENTRYPOINTS", ""))
@@ -364,4 +385,35 @@ func envDuration(key string, def time.Duration) time.Duration {
 		}
 	}
 	return def
+}
+
+// envBytes reads a byte size from the environment. It accepts a plain integer
+// (bytes) or a value with a KB/MB/GB/KiB/MiB/GiB suffix (case-insensitive,
+// base-1024), e.g. "256MB". A non-positive or unparseable value falls back to def.
+func envBytes(key string, def int64) int64 {
+	v, ok := os.LookupEnv(key)
+	if !ok {
+		return def
+	}
+	s := strings.TrimSpace(v)
+	if s == "" {
+		return def
+	}
+	mult := int64(1)
+	up := strings.ToUpper(s)
+	for _, suf := range []struct {
+		s string
+		m int64
+	}{{"GIB", 1 << 30}, {"GB", 1 << 30}, {"MIB", 1 << 20}, {"MB", 1 << 20}, {"KIB", 1 << 10}, {"KB", 1 << 10}, {"B", 1}} {
+		if strings.HasSuffix(up, suf.s) {
+			mult = suf.m
+			s = strings.TrimSpace(s[:len(s)-len(suf.s)])
+			break
+		}
+	}
+	n, err := strconv.ParseInt(s, 10, 64)
+	if err != nil || n <= 0 {
+		return def
+	}
+	return n * mult
 }

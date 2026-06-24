@@ -300,13 +300,18 @@ func TestDefaultSiteAndRawConfig(t *testing.T) {
 
 func TestPluginsToggle(t *testing.T) {
 	ts, _, c := adminAPI(t)
-	if code, b := call(t, c, "GET", ts.URL+"/api/plugins", ""); code != http.StatusOK || !strings.Contains(string(b), "wafEnabled") {
+	if code, b := call(t, c, "GET", ts.URL+"/api/plugins", ""); code != http.StatusOK || !strings.Contains(string(b), "wafParanoia") {
 		t.Errorf("get plugins = %d: %s", code, b)
 	}
-	// Toggle WAF off + cache on (writes static config to the temp path, no restart).
-	set := `{"wafEnabled":false,"wafRuleset":"curated","cacheEnabled":true}`
+	// Native WAF: set paranoia/anomaly + cache on. Pure hot-reload (no Traefik restart).
+	set := `{"wafEnabled":true,"wafParanoia":2,"wafAnomaly":7,"wafDirectives":[],"cacheEnabled":true}`
 	if code, b := call(t, c, "PUT", ts.URL+"/api/plugins", set); code != http.StatusOK {
 		t.Errorf("set plugins = %d: %s", code, b)
+	}
+	// A malformed custom seclang directive is rejected (422) BEFORE it is persisted.
+	bad := `{"wafEnabled":true,"wafDirectives":["TotallyNotADirective foo"]}`
+	if code, b := call(t, c, "PUT", ts.URL+"/api/plugins", bad); code != http.StatusUnprocessableEntity {
+		t.Errorf("malformed WAF directive should be 422, got %d: %s", code, b)
 	}
 	if code, b := call(t, c, "GET", ts.URL+"/api/security/metrics", ""); code != http.StatusOK || !strings.Contains(string(b), "wafEnabled") {
 		t.Errorf("security metrics = %d: %s", code, b)

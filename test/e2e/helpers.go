@@ -38,6 +38,17 @@ func discardLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }
 
+// postJSON POSTs a JSON body and returns the status code (body closed).
+func postJSON(t *testing.T, client *http.Client, url, body string) int {
+	t.Helper()
+	resp, err := client.Post(url, "application/json", bytes.NewReader([]byte(body)))
+	if err != nil {
+		t.Fatalf("POST %s: %v", url, err)
+	}
+	resp.Body.Close()
+	return resp.StatusCode
+}
+
 // freePorts reserves n distinct free TCP ports on loopback and releases them, so
 // the static config can name fixed ports before Traefik binds. All listeners are
 // held open simultaneously so the returned ports are guaranteed distinct.

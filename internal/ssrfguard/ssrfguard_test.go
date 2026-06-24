@@ -1,6 +1,35 @@
 package ssrfguard
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
+
+// S6: CheckAddr runs on the already-resolved dial address (ip:port) so it closes the
+// DNS-rebinding gap CheckHost can't. It must block loopback/link-local/metadata and
+// fail closed on a non-IP address.
+func TestCheckAddr(t *testing.T) {
+	blocked := []string{"127.0.0.1:80", "[::1]:443", "169.254.169.254:80", "0.0.0.0:25"}
+	for _, a := range blocked {
+		if err := CheckAddr(a); err == nil {
+			t.Errorf("CheckAddr(%q) = nil, want blocked", a)
+		}
+	}
+	allowed := []string{"8.8.8.8:443", "10.0.0.5:80", "172.16.0.1:587", "[2606:4700:4700::1111]:443"}
+	for _, a := range allowed {
+		if err := CheckAddr(a); err != nil {
+			t.Errorf("CheckAddr(%q) = %v, want allowed", a, err)
+		}
+	}
+	// Control always receives a resolved IP; a non-IP host here is unexpected → fail closed.
+	if err := CheckAddr("example.com:80"); err == nil {
+		t.Error("CheckAddr with a non-IP host should fail closed")
+	}
+	// DialControl is the net.Dialer.Control wrapper.
+	if err := DialControl("tcp", "127.0.0.1:80", nil); err == nil || !strings.Contains(err.Error(), "blocked") {
+		t.Errorf("DialControl(loopback) = %v, want blocked", err)
+	}
+}
 
 func TestCheckHost(t *testing.T) {
 	blocked := []string{"127.0.0.1", "::1", "169.254.169.254", "169.254.0.1", "0.0.0.0", "[::1]"}

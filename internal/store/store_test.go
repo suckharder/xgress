@@ -461,6 +461,38 @@ func TestSessionLifecycle(t *testing.T) {
 	}
 }
 
+// S7: the live token must never be stored verbatim — the DB holds only sha256(token),
+// so a database read can't hand out usable sessions. Lookups by the live token still work.
+func TestSessionTokenHashedAtRest(t *testing.T) {
+	st, ctx := newTestStore(t)
+	u := &User{Email: "h@x.com", Role: RoleViewer, PasswordHash: "h"}
+	_ = st.CreateUser(ctx, u)
+
+	const tok = "live-session-token-xyz"
+	if err := st.CreateSession(ctx, &Session{Token: tok, UserID: u.ID, ExpiresAt: time.Now().Add(time.Hour)}); err != nil {
+		t.Fatal(err)
+	}
+
+	var stored string
+	if err := st.queryRow(ctx, `SELECT token FROM sessions WHERE user_id = ?`, u.ID).Scan(&stored); err != nil {
+		t.Fatal(err)
+	}
+	if stored == tok {
+		t.Fatal("session token stored verbatim at rest (must be hashed)")
+	}
+	if stored != hashSessionToken(tok) {
+		t.Errorf("stored token = %q, want sha256(token) = %q", stored, hashSessionToken(tok))
+	}
+	// The live token still resolves the session, and its hash never leaks out.
+	got, err := st.GetSession(ctx, tok)
+	if err != nil {
+		t.Fatalf("GetSession(live token): %v", err)
+	}
+	if got.Token != tok {
+		t.Errorf("GetSession returned token %q, want the live token %q (not the hash)", got.Token, tok)
+	}
+}
+
 func TestLeaseLeaderElection(t *testing.T) {
 	st, ctx := newTestStore(t)
 	// First holder takes the lease.

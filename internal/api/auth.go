@@ -215,7 +215,7 @@ func (s *Server) setSessionCookie(w http.ResponseWriter, token string, exp time.
 		Expires:  exp,
 		HttpOnly: true,
 		SameSite: http.SameSiteLaxMode,
-		Secure:   !s.cfg.Dev,
+		Secure:   !s.cfg.Dev && !s.cfg.AdminInsecureCookie,
 	})
 }
 
@@ -227,7 +227,7 @@ func (s *Server) clearSessionCookie(w http.ResponseWriter) {
 		MaxAge:   -1,
 		HttpOnly: true,
 		SameSite: http.SameSiteLaxMode,
-		Secure:   !s.cfg.Dev,
+		Secure:   !s.cfg.Dev && !s.cfg.AdminInsecureCookie,
 	})
 }
 

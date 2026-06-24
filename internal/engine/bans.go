@@ -31,14 +31,27 @@ type BanConfig struct {
 	DurationSec int  `json:"durationSec"`
 }
 
-// BanConfig resolves the current auto-ban settings from the store.
-func (e *Engine) BanConfig(ctx context.Context) BanConfig {
+// loadBanConfig reads the auto-ban settings from the store (4 reads).
+func (e *Engine) loadBanConfig(ctx context.Context) BanConfig {
 	return BanConfig{
 		Enabled:     e.settingBool(ctx, keyBanEnabled, false),
 		Threshold:   e.settingInt(ctx, keyBanThreshold, defBanThreshold),
 		WindowSec:   e.settingInt(ctx, keyBanWindowSec, defBanWindowSec),
 		DurationSec: e.settingInt(ctx, keyBanDuration, defBanDuration),
 	}
+}
+
+// BanConfig returns the current auto-ban settings, served from an in-memory cache
+// so the hot WAF-block path (onWAFEvent) doesn't issue 4 DB reads per blocked
+// request. The cache is the source of truth within the process: SetBanConfig is the
+// only writer and refreshes it; the first read lazily loads it. (P1-7)
+func (e *Engine) BanConfig(ctx context.Context) BanConfig {
+	if c := e.banConfig.Load(); c != nil {
+		return *c
+	}
+	c := e.loadBanConfig(ctx)
+	e.banConfig.Store(&c)
+	return c
 }
 
 // SetBanConfig persists the auto-ban settings.
@@ -52,17 +65,19 @@ func (e *Engine) SetBanConfig(ctx context.Context, c BanConfig) error {
 	if c.DurationSec < 0 {
 		c.DurationSec = defBanDuration
 	}
-	set := func(k, v string) error { return e.st.SetSetting(ctx, k, v) }
-	if err := set(keyBanEnabled, boolStr(c.Enabled)); err != nil {
-		return err
+	for _, kv := range []struct{ k, v string }{
+		{keyBanEnabled, boolStr(c.Enabled)},
+		{keyBanThreshold, fmt.Sprint(c.Threshold)},
+		{keyBanWindowSec, fmt.Sprint(c.WindowSec)},
+		{keyBanDuration, fmt.Sprint(c.DurationSec)},
+	} {
+		if err := e.st.SetSetting(ctx, kv.k, kv.v); err != nil {
+			e.banConfig.Store(nil) // partial write: invalidate so the next read reloads from DB
+			return err
+		}
 	}
-	if err := set(keyBanThreshold, fmt.Sprint(c.Threshold)); err != nil {
-		return err
-	}
-	if err := set(keyBanWindowSec, fmt.Sprint(c.WindowSec)); err != nil {
-		return err
-	}
-	return set(keyBanDuration, fmt.Sprint(c.DurationSec))
+	e.banConfig.Store(&c) // refresh the cache so onWAFEvent sees the change with no DB read
+	return nil
 }
 
 // onWAFEvent is invoked (off the request path) for every WAF detection. When

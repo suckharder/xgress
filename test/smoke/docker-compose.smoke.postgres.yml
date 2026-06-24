@@ -14,7 +14,6 @@ services:
     volumes:
       - xgress_data:/data
     environment:
-      XGRESS_WAF_PRELOAD: "false"
       XGRESS_DB_DRIVER: "postgres"
       XGRESS_DB_DSN: "postgres://xgress:xgress@db:5432/xgress?sslmode=disable"
     depends_on:

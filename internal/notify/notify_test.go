@@ -14,6 +14,15 @@ import (
 
 func discardLog() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, nil)) }
 
+// newUnguarded builds a dispatcher with the dial-time SSRF guard disabled, so a test
+// can point a webhook at a loopback httptest server. The guard correctly blocks
+// loopback in production — that behaviour is verified in TestWebhookDialGuardBlocksLoopback.
+func newUnguarded(provider ConfigProvider) *Dispatcher {
+	d := New(provider, discardLog())
+	d.dialer.Control = nil // Control is read per-dial, so this disables the guard
+	return d
+}
+
 func TestConfigEnabled(t *testing.T) {
 	cases := []struct {
 		name string
@@ -53,7 +62,7 @@ func TestNotifyPostsToWebhook(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	d := New(func(ctx context.Context) Config { return Config{WebhookURL: ts.URL} }, discardLog())
+	d := newUnguarded(func(ctx context.Context) Config { return Config{WebhookURL: ts.URL} })
 	d.Notify(context.Background(), "error", "Cert failed", "details here")
 
 	if atomic.LoadInt64(&calls) != 1 {
@@ -80,7 +89,7 @@ func TestNotifyNoChannelIsNoop(t *testing.T) {
 
 func TestTestWebhookSurfacesErrors(t *testing.T) {
 	// No channel → explicit error.
-	d := New(func(ctx context.Context) Config { return Config{} }, discardLog())
+	d := newUnguarded(func(ctx context.Context) Config { return Config{} })
 	if err := d.Test(context.Background(), Config{}); err == nil {
 		t.Error("Test with no channel should error")
 	}
@@ -99,6 +108,22 @@ func TestTestWebhookSurfacesErrors(t *testing.T) {
 	defer ok.Close()
 	if err := d.Test(context.Background(), Config{WebhookURL: ok.URL}); err != nil {
 		t.Errorf("Test against a 2xx webhook should succeed: %v", err)
+	}
+}
+
+// S6: the dial-time SSRF guard must block a webhook pointed at loopback (e.g.
+// xgress's own provider/admin) even if it passed a save-time check (DNS rebinding).
+func TestWebhookDialGuardBlocksLoopback(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(200) }))
+	defer ts.Close()
+
+	d := New(func(ctx context.Context) Config { return Config{WebhookURL: ts.URL} }, discardLog()) // guard ON
+	err := d.Test(context.Background(), Config{WebhookURL: ts.URL})                                // ts.URL is 127.0.0.1:port
+	if err == nil {
+		t.Fatal("a loopback webhook must be blocked by the dial-time SSRF guard")
+	}
+	if !strings.Contains(err.Error(), "blocked") {
+		t.Errorf("error should come from the SSRF guard, got: %v", err)
 	}
 }
 

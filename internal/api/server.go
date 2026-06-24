@@ -183,14 +183,19 @@ func (s *Server) handleProvider(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	// Fast path: answer a no-change poll with 304 using the cheap render hash, BEFORE
+	// ProviderDocument decrypts every certificate key and reads each cert from the DB.
+	// This is the steady state (Traefik polls ~1s), so it keeps the poll near-free.
+	// The 304 condition is identical to comparing against ProviderDocument's etag —
+	// both are the rendered config hash — so behavior is unchanged.
+	if match := r.Header.Get("If-None-Match"); match != "" && strings.Trim(match, `"`) == s.engine.RenderedHash() {
+		w.WriteHeader(http.StatusNotModified)
+		return
+	}
 	doc, etag, err := s.engine.ProviderDocument(r.Context())
 	if err != nil {
 		s.log.Error("provider document error", "err", err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	if match := r.Header.Get("If-None-Match"); match != "" && strings.Trim(match, `"`) == etag {
-		w.WriteHeader(http.StatusNotModified)
 		return
 	}
 	w.Header().Set("ETag", `"`+etag+`"`)
@@ -203,6 +208,8 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		"status":        "ok",
 		"configVersion": s.engine.Version(),
 		"traefik":       s.engine.Supervisor().Status(),
+		"recovery":      s.engine.RecoveryState(),
+		"waf":           s.engine.WAFStatus(),
 	})
 }
 

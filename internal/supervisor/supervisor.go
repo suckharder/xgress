@@ -46,7 +46,21 @@ type Options struct {
 	Managed      bool          // false => external Traefik, supervisor is inert
 	RestartDrain time.Duration // grace period before SIGKILL on restart/stop
 	Logger       *slog.Logger
+
+	// OnCrashLoop is fired (once per trip, in its own goroutine) when Traefik exits
+	// too many times too fast — respawning can't fix a startup/static-config failure,
+	// so the engine takes a bounded recovery action instead. Optional.
+	OnCrashLoop func()
 }
+
+// Crash-loop guard tuning: if Traefik exits crashThreshold times within crashWindow,
+// stop auto-respawning and fire OnCrashLoop. A run that stays up for healthyReset
+// clears the window.
+const (
+	crashThreshold = 3
+	crashWindow    = 10 * time.Second
+	healthyReset   = 30 * time.Second
+)
 
 // Supervisor manages a single Traefik process.
 type Supervisor struct {
@@ -59,6 +73,11 @@ type Supervisor struct {
 	startedAt time.Time
 	lastExit  error
 	wantStop  bool
+
+	// crash-loop guard
+	recentExits []time.Time
+	crashLoop   bool
+	healthTimer *time.Timer
 
 	// log ring buffer
 	ring   []LogLine
@@ -86,6 +105,10 @@ func New(opts Options) *Supervisor {
 	}
 	return s
 }
+
+// SetOnCrashLoop registers the crash-loop callback. Call before Start (no spawn
+// goroutine is running yet, so there's no race with the reader).
+func (s *Supervisor) SetOnCrashLoop(fn func()) { s.opts.OnCrashLoop = fn }
 
 // Start launches Traefik (no-op when unmanaged). It also starts a watchdog that
 // restarts the process if it crashes unexpectedly.
@@ -130,6 +153,19 @@ func (s *Supervisor) spawnLocked(ctx context.Context) error {
 	s.wantStop = false
 	s.exited = make(chan struct{})
 
+	// A run that stays healthy for healthyReset clears the crash window, so a slow
+	// drip of unrelated restarts never trips the guard.
+	if s.healthTimer != nil {
+		s.healthTimer.Stop()
+	}
+	s.healthTimer = time.AfterFunc(healthyReset, func() {
+		s.mu.Lock()
+		if s.state == StateRunning {
+			s.recentExits = nil
+		}
+		s.mu.Unlock()
+	})
+
 	go s.consume(stdout)
 	go s.consume(stderr)
 
@@ -144,15 +180,44 @@ func (s *Supervisor) spawnLocked(ctx context.Context) error {
 		} else {
 			s.state = StateCrashed
 		}
+		// Crash-loop guard: count unexpected exits within the window. Once it trips,
+		// stop respawning (the next process reads the same bad config and dies again)
+		// and let the engine recover.
+		tripped := false
+		if !stopWanted {
+			now := time.Now()
+			cutoff := now.Add(-crashWindow)
+			kept := s.recentExits[:0]
+			for _, t := range s.recentExits {
+				if t.After(cutoff) {
+					kept = append(kept, t)
+				}
+			}
+			s.recentExits = append(kept, now)
+			if len(s.recentExits) >= crashThreshold && !s.crashLoop {
+				s.crashLoop = true
+				tripped = true
+			}
+		}
+		crashLoop := s.crashLoop
 		s.mu.Unlock()
 		close(exited)
 
-		if !stopWanted && ctx.Err() == nil {
-			s.log.Error("traefik exited unexpectedly; restarting", "err", err)
-			time.Sleep(time.Second)
-			if ctx.Err() == nil {
-				_ = s.spawn(ctx)
+		if stopWanted || ctx.Err() != nil {
+			return
+		}
+		if crashLoop {
+			if tripped {
+				s.log.Error("traefik crash-loop detected; halting auto-respawn",
+					"threshold", crashThreshold, "window", crashWindow.String())
+				s.fireCrashLoop()
 			}
+			return // do NOT respawn into the same failure
+		}
+		s.log.Error("traefik exited unexpectedly; restarting", "err", err)
+		time.Sleep(time.Second)
+		if ctx.Err() == nil {
+			_ = s.spawn(ctx)
 		}
 	}()
 
@@ -169,6 +234,10 @@ func (s *Supervisor) Restart(ctx context.Context) error {
 	}
 	s.mu.Lock()
 	s.state = StateRestart
+	// A deliberate restart (operator action or engine recovery) is a fresh start —
+	// clear the crash-loop latch + window so recovery restarts aren't miscounted.
+	s.crashLoop = false
+	s.recentExits = nil
 	s.mu.Unlock()
 	if err := s.stopProcess(); err != nil {
 		s.log.Warn("error stopping traefik during restart", "err", err)
@@ -239,9 +308,22 @@ func (s *Supervisor) consume(r io.Reader) {
 		obs := s.observers
 		s.obsMu.RUnlock()
 		for _, fn := range obs {
-			fn(ll)
+			s.safeObserve(fn, ll)
 		}
 	}
+}
+
+// safeObserve invokes a log observer with panic isolation. The engine registers
+// its fatal-crash detector as an observer; without this guard a single panicking
+// observer would kill the log-consume goroutine and silently disable Traefik
+// crash detection (and the self-heal recovery that depends on it).
+func (s *Supervisor) safeObserve(fn func(LogLine), ll LogLine) {
+	defer func() {
+		if r := recover(); r != nil {
+			s.log.Error("supervisor: log observer panicked (recovered)", "panic", r)
+		}
+	}()
+	fn(ll)
 }
 
 // AddLogObserver registers a callback invoked for every captured Traefik log
@@ -283,13 +365,16 @@ type Status struct {
 	StartedAt time.Time `json:"startedAt"`
 	LastError string    `json:"lastError,omitempty"`
 	Managed   bool      `json:"managed"`
+	CrashLoop bool      `json:"crashLoop"` // auto-respawn halted; awaiting recovery
+	Restarts  int       `json:"restarts"`  // unexpected exits in the current window
 }
 
 // Status returns a snapshot of the supervised process state.
 func (s *Supervisor) Status() Status {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	st := Status{State: s.state, StartedAt: s.startedAt, Managed: s.opts.Managed}
+	st := Status{State: s.state, StartedAt: s.startedAt, Managed: s.opts.Managed,
+		CrashLoop: s.crashLoop, Restarts: len(s.recentExits)}
 	if s.cmd != nil && s.cmd.Process != nil {
 		st.Pid = s.cmd.Process.Pid
 	}
@@ -297,4 +382,37 @@ func (s *Supervisor) Status() Status {
 		st.LastError = s.lastExit.Error()
 	}
 	return st
+}
+
+// TripCrashLoop forces the crash-loop state and fires OnCrashLoop once (used by
+// the first-fatal-signature log observer, which trips recovery before the
+// 3-in-10s window fills). Idempotent: a no-op if already tripped.
+func (s *Supervisor) TripCrashLoop() {
+	s.mu.Lock()
+	if s.crashLoop {
+		s.mu.Unlock()
+		return
+	}
+	s.crashLoop = true
+	s.mu.Unlock()
+	s.fireCrashLoop()
+}
+
+// fireCrashLoop invokes the crash-loop callback in its own goroutine with panic
+// isolation. The supervisor runs under PID 1, so an unrecovered panic in this
+// goroutine would crash the whole process — the callback must never be trusted to
+// recover itself (mirrors safeObserve). A nil callback is a no-op.
+func (s *Supervisor) fireCrashLoop() {
+	cb := s.opts.OnCrashLoop
+	if cb == nil {
+		return
+	}
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				s.log.Error("supervisor: OnCrashLoop callback panicked (recovered)", "panic", r)
+			}
+		}()
+		cb()
+	}()
 }

@@ -7,13 +7,17 @@ package notify
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/smtp"
 	"strings"
 	"time"
+
+	"github.com/suckharder/xgress/internal/ssrfguard"
 )
 
 // Config is resolved from settings at send time so changes take effect live.
@@ -41,14 +45,24 @@ type Dispatcher struct {
 	provider ConfigProvider
 	log      *slog.Logger
 	client   *http.Client
+	dialer   *net.Dialer // SSRF-guarded at connect time (webhook + SMTP)
 }
 
-// New constructs a Dispatcher.
+// New constructs a Dispatcher. Outbound sinks (webhook, SMTP) dial through an
+// SSRF-guarded dialer that re-checks the SSRF policy on the resolved IP at connect
+// time, so a DNS-rebinding host that resolved benign at save can't reach loopback /
+// the metadata service later (S6).
 func New(provider ConfigProvider, log *slog.Logger) *Dispatcher {
 	if log == nil {
 		log = slog.Default()
 	}
-	return &Dispatcher{provider: provider, log: log, client: &http.Client{Timeout: 10 * time.Second}}
+	dialer := &net.Dialer{Timeout: 10 * time.Second, Control: ssrfguard.DialControl}
+	tr := http.DefaultTransport.(*http.Transport).Clone()
+	tr.DialContext = dialer.DialContext
+	return &Dispatcher{
+		provider: provider, log: log, dialer: dialer,
+		client: &http.Client{Timeout: 10 * time.Second, Transport: tr},
+	}
 }
 
 // Notify delivers a message to all configured channels (best-effort).
@@ -121,11 +135,51 @@ func (d *Dispatcher) sendEmail(cfg Config, subject, body string) error {
 	addr := cfg.SMTPHost + ":" + port
 	msg := buildMessage(from, cfg.EmailTo, subject, body)
 
-	var auth smtp.Auth
-	if cfg.SMTPUser != "" {
-		auth = smtp.PlainAuth("", cfg.SMTPUser, cfg.SMTPPass, cfg.SMTPHost)
+	// Dial through the SSRF-guarded dialer (S6), then drive SMTP manually — this
+	// mirrors smtp.SendMail (STARTTLS when offered, PlainAuth over TLS) but lets us
+	// enforce the connect-time SSRF check that SendMail's internal net.Dial can't.
+	conn, err := d.dialer.Dial("tcp", addr)
+	if err != nil {
+		return err
 	}
-	return smtp.SendMail(addr, auth, from, strings.Split(cfg.EmailTo, ","), msg)
+	c, err := smtp.NewClient(conn, cfg.SMTPHost)
+	if err != nil {
+		_ = conn.Close()
+		return err
+	}
+	defer c.Close()
+	if ok, _ := c.Extension("STARTTLS"); ok {
+		if err := c.StartTLS(&tls.Config{ServerName: cfg.SMTPHost}); err != nil {
+			return err
+		}
+	}
+	if cfg.SMTPUser != "" {
+		if err := c.Auth(smtp.PlainAuth("", cfg.SMTPUser, cfg.SMTPPass, cfg.SMTPHost)); err != nil {
+			return err
+		}
+	}
+	if err := c.Mail(from); err != nil {
+		return err
+	}
+	for _, rcpt := range strings.Split(cfg.EmailTo, ",") {
+		if rcpt = strings.TrimSpace(rcpt); rcpt != "" {
+			if err := c.Rcpt(rcpt); err != nil {
+				return err
+			}
+		}
+	}
+	wc, err := c.Data()
+	if err != nil {
+		return err
+	}
+	if _, err := wc.Write(msg); err != nil {
+		_ = wc.Close()
+		return err
+	}
+	if err := wc.Close(); err != nil {
+		return err
+	}
+	return c.Quit()
 }
 
 func buildMessage(from, to, subject, body string) []byte {

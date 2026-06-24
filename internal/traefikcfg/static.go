@@ -25,20 +25,16 @@ type StaticParams struct {
 	ProviderToken     string // sent as the ProviderTokenHeader on each poll (auth)
 	PollInterval      string // e.g. "1s"
 	StreamEntryPoints []config.StreamEntryPoint
-	APIListen         string       // loopback addr for Traefik's read-only API (empty = off)
-	Plugins           []PluginDecl // experimental.plugins to load at startup
+	APIListen         string // loopback addr for Traefik's read-only API (empty = off)
 	LogLevel          string
 	AccessLog         bool
 	MetricsProm       bool
-}
 
-// PluginDecl declares a Traefik plugin to load via experimental.plugins. Traefik
-// fetches it from the plugin catalog at startup and caches it under
-// ./plugins-storage (we run Traefik with its workdir on the persisted volume).
-type PluginDecl struct {
-	Name       string // the key under experimental.plugins (referenced by middlewares)
-	ModuleName string
-	Version    string
+	// Minimal strips everything non-essential (read-only API, metrics, access log,
+	// stream entrypoints) leaving only the HTTP/HTTPS entrypoints and the HTTP
+	// provider. The self-heal escalation ladder writes a minimal config as a
+	// last resort so Traefik always boots.
+	Minimal bool
 }
 
 // RenderStatic produces the YAML bytes for traefik.yml.
@@ -55,16 +51,18 @@ func RenderStatic(p StaticParams) ([]byte, error) {
 		},
 	}
 	// Additional TCP/UDP stream entrypoints, declared in process config to match
-	// container-published ports.
-	for _, l := range p.StreamEntryPoints {
-		entryPoints[l.Name] = map[string]any{"address": fmt.Sprintf(":%d/%s", l.Port, protoOrTCP(l.Proto))}
+	// container-published ports. Skipped in minimal (recovery) mode.
+	if !p.Minimal {
+		for _, l := range p.StreamEntryPoints {
+			entryPoints[l.Name] = map[string]any{"address": fmt.Sprintf(":%d/%s", l.Port, protoOrTCP(l.Proto))}
+		}
 	}
 
 	// Traefik's own read-only API + dashboard, bound to a loopback entrypoint so
 	// xgress can read live state. api.insecure serves it on this entrypoint without
 	// auth — safe because the address is loopback-only.
 	api := map[string]any{"dashboard": false, "insecure": false}
-	if p.APIListen != "" {
+	if p.APIListen != "" && !p.Minimal {
 		entryPoints["traefik"] = map[string]any{"address": p.APIListen}
 		api = map[string]any{"dashboard": true, "insecure": true}
 	}
@@ -93,17 +91,10 @@ func RenderStatic(p StaticParams) ([]byte, error) {
 			"entryPoint": p.HTTPEntryPoint,
 		},
 	}
-	if len(p.Plugins) > 0 {
-		plugins := map[string]any{}
-		for _, pl := range p.Plugins {
-			plugins[pl.Name] = map[string]any{"moduleName": pl.ModuleName, "version": pl.Version}
-		}
-		root["experimental"] = map[string]any{"plugins": plugins}
-	}
-	if p.AccessLog {
+	if p.AccessLog && !p.Minimal {
 		root["accessLog"] = map[string]any{"format": "json"}
 	}
-	if p.MetricsProm {
+	if p.MetricsProm && !p.Minimal {
 		root["metrics"] = map[string]any{"prometheus": map[string]any{"addEntryPointsLabels": true, "addRoutersLabels": true}}
 	}
 

@@ -1,4 +1,4 @@
-VERSION ?= 0.9.0-rc.1
+VERSION ?= 0.10.0
 COMMIT  := $(shell git rev-parse --short HEAD 2>/dev/null || echo dev)
 DATE    := $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
 LDFLAGS := -s -w \

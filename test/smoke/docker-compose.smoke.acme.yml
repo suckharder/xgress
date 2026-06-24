@@ -32,7 +32,6 @@ services:
       # The smoke test extracts Pebble's static minica to ./testdata before `up`.
       - ./testdata/pebble.minica.pem:/etc/ssl/certs/pebble-minica.pem:ro
     environment:
-      XGRESS_WAF_PRELOAD: "false"
       XGRESS_ACME_EMAIL: "ops@smoke.test"
       XGRESS_ACME_CA_URL: "https://pebble:14000/dir"
       LEGO_CA_CERTIFICATES: "/etc/ssl/certs/pebble-minica.pem"

@@ -1,6 +1,7 @@
 package edge
 
 import (
+	"bytes"
 	"context"
 	"io"
 	"log/slog"
@@ -34,7 +35,7 @@ func TestEdgeTokenGate(t *testing.T) {
 	port, _ := strconv.Atoi(u.Port())
 
 	const token = "edge-secret-token"
-	s := New(NewMemStore(), time.Minute, token, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	s := New(NewMemStore(context.Background(), MemLimits{}), time.Minute, token, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	s.SetHosts([]*store.Host{{
 		ID: "h1", Kind: store.HostKindProxy, Enabled: true,
 		Domains:   []string{"cache.local"},
@@ -90,9 +91,9 @@ func edgeFor(t *testing.T, domain, backendURL string, ttl time.Duration) *Server
 	t.Helper()
 	u, _ := url.Parse(backendURL)
 	port, _ := strconv.Atoi(u.Port())
-	s := New(NewMemStore(), ttl, "", slog.New(slog.NewTextHandler(io.Discard, nil)))
+	s := New(NewMemStore(context.Background(), MemLimits{}), ttl, "", slog.New(slog.NewTextHandler(io.Discard, nil)))
 	s.SetHosts([]*store.Host{{
-		ID: "h1", Kind: store.HostKindProxy, Enabled: true,
+		ID: "h1", Kind: store.HostKindProxy, Enabled: true, Cache: true,
 		Domains:   []string{domain},
 		Upstreams: []store.Upstream{{Scheme: "http", Host: u.Hostname(), Port: port}},
 	}})
@@ -138,7 +139,7 @@ func TestCacheKeyVariesByPathAndDomain(t *testing.T) {
 	u, _ := url.Parse(be.URL)
 	port, _ := strconv.Atoi(u.Port())
 	s.SetHosts([]*store.Host{{
-		ID: "h1", Kind: store.HostKindProxy, Enabled: true,
+		ID: "h1", Kind: store.HostKindProxy, Enabled: true, Cache: true,
 		Domains:   []string{"cache.local", "other.local"},
 		Upstreams: []store.Upstream{{Scheme: "http", Host: u.Hostname(), Port: port}},
 	}})
@@ -169,8 +170,48 @@ func TestUncacheableMethodsAndAuthAlwaysProxy(t *testing.T) {
 	}
 }
 
+// P0-4: a response larger than the per-request buffer ceiling must be streamed in
+// full (never truncated) and never cached — so the edge can't be made to hold N×
+// huge responses on the heap.
+func TestOversizedResponseStreamsInFullAndIsNotCached(t *testing.T) {
+	const bodyLen = 64 * 1024 // 64 KiB, well over the 1 KiB ceiling set below
+	var hits int64
+	be := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		atomic.AddInt64(&hits, 1)
+		w.Header().Set("Cache-Control", "max-age=60") // would be cacheable if small enough
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(bytes.Repeat([]byte("x"), bodyLen))
+	}))
+	t.Cleanup(be.Close)
+	u, _ := url.Parse(be.URL)
+	port, _ := strconv.Atoi(u.Port())
+
+	s := New(NewMemStore(context.Background(), MemLimits{}), time.Minute, "", slog.New(slog.NewTextHandler(io.Discard, nil)))
+	s.SetEntryLimit(1024) // ceiling far below the response body
+	s.SetHosts([]*store.Host{{
+		ID: "h1", Kind: store.HostKindProxy, Enabled: true, Cache: true,
+		Domains:   []string{"big.local"},
+		Upstreams: []store.Upstream{{Scheme: "http", Host: u.Hostname(), Port: port}},
+	}})
+
+	r1 := reqTo(s, "GET", "big.local", "/big")
+	b1, _ := io.ReadAll(r1.Body)
+	if len(b1) != bodyLen {
+		t.Fatalf("streamed body length = %d, want %d (must not be truncated)", len(b1), bodyLen)
+	}
+	if got := r1.Header.Get("X-xgress-Cache"); got != "MISS" {
+		t.Errorf("oversized response cache header = %q, want MISS", got)
+	}
+	// Second request must hit the backend again — oversized responses are not cached.
+	r2 := reqTo(s, "GET", "big.local", "/big")
+	_, _ = io.ReadAll(r2.Body)
+	if got := atomic.LoadInt64(&hits); got != 2 {
+		t.Errorf("backend hits = %d, want 2 (oversized response must not be cached)", got)
+	}
+}
+
 func TestNoCacheHostReturnsBadGateway(t *testing.T) {
-	s := New(NewMemStore(), time.Minute, "", slog.New(slog.NewTextHandler(io.Discard, nil)))
+	s := New(NewMemStore(context.Background(), MemLimits{}), time.Minute, "", slog.New(slog.NewTextHandler(io.Discard, nil)))
 	r := reqTo(s, "GET", "unknown.local", "/")
 	if r.StatusCode != http.StatusBadGateway {
 		t.Errorf("unknown host = %d, want 502", r.StatusCode)
@@ -178,7 +219,7 @@ func TestNoCacheHostReturnsBadGateway(t *testing.T) {
 }
 
 func TestSetHostsSkipsDisabledAndNonProxy(t *testing.T) {
-	s := New(NewMemStore(), time.Minute, "", slog.New(slog.NewTextHandler(io.Discard, nil)))
+	s := New(NewMemStore(context.Background(), MemLimits{}), time.Minute, "", slog.New(slog.NewTextHandler(io.Discard, nil)))
 	s.SetHosts([]*store.Host{
 		{ID: "1", Kind: store.HostKindProxy, Enabled: false, Domains: []string{"disabled.local"}},
 		{ID: "2", Kind: store.HostKindStream, Enabled: true, Domains: []string{"stream.local"}},
@@ -299,7 +340,7 @@ func TestEncodeDecodeRoundTrip(t *testing.T) {
 }
 
 func TestPickBackendRoundRobinAndGroups(t *testing.T) {
-	s := New(NewMemStore(), time.Minute, "", slog.New(slog.NewTextHandler(io.Discard, nil)))
+	s := New(NewMemStore(context.Background(), MemLimits{}), time.Minute, "", slog.New(slog.NewTextHandler(io.Discard, nil)))
 	h := &store.Host{ID: "rr", Upstreams: []store.Upstream{
 		{Scheme: "http", Host: "a", Port: 80},
 		{Scheme: "https", Host: "b", Port: 8443},

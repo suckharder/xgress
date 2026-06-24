@@ -34,9 +34,10 @@ services:
       - traefik_static:/data/traefik         # shared static config
 
   traefik:
-    # Pinned + digest-locked to the supported Traefik (v3.7.5)
+    # Pinned + digest-locked to the supported Traefik (v3.7.5). No plugins are
+    # loaded — the WAF runs in-process inside xgress (WAF hosts are routed to the
+    # token-gated xgress edge), so Traefik needs no catalog access or plugin storage.
     image: traefik:v3.7.5@sha256:d6858791f9e74df44ca4014166647c41cdc2abd3bf2a71b832ca4e1c6a91b257
-    working_dir: /data   # persist the fetched WAF plugin across restarts
     container_name: traefik
     restart: unless-stopped
     depends_on:

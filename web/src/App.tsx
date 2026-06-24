@@ -1,9 +1,9 @@
 import React from "react";
 import { NavLink, Navigate, Route, Routes, useLocation, useNavigate } from "react-router-dom";
 import { api } from "./api";
-import type { User } from "./types";
+import type { User, TraefikStatus } from "./types";
 import { Icon, IconName } from "./icons";
-import { useAsync } from "./components";
+import { useAsync, Banner } from "./components";
 import { engineColor, engineLabel } from "./lib/status";
 import { Auth } from "./pages/Auth";
 import { Dashboard } from "./pages/Dashboard";
@@ -66,6 +66,13 @@ function Shell({ user, onLogout }: { user: User; onLogout: () => void }) {
 
   React.useEffect(() => { setNavOpen(false); }, [loc.pathname]);
 
+  // Single engine-status poll, shared by the top-bar badge and the crash-loop banner.
+  const engine = useAsync(() => api.traefikStatus(), []);
+  React.useEffect(() => {
+    const t = setInterval(engine.reload, 8000);
+    return () => clearInterval(t);
+  }, [engine.reload]);
+
   const logout = async () => { await api.logout(); onLogout(); nav("/"); };
   const title = TITLES[loc.pathname] ?? "xgress";
   const initial = (user.name || user.email || "?").trim().charAt(0).toUpperCase();
@@ -109,8 +116,9 @@ function Shell({ user, onLogout }: { user: User; onLogout: () => void }) {
           </button>
           <h1>{title}</h1>
           <div className="spacer" />
-          <EngineStatus />
+          <EngineStatus status={engine.data ?? null} />
         </header>
+        <CrashLoopBanner status={engine.data ?? null} />
         <Routes>
           <Route path="/" element={<Dashboard />} />
           <Route path="/hosts" element={<Hosts />} />
@@ -130,15 +138,24 @@ function Shell({ user, onLogout }: { user: User; onLogout: () => void }) {
   );
 }
 
-// Compact, always-visible engine state in the top bar — the system's pulse.
-function EngineStatus() {
-  const status = useAsync(() => api.traefikStatus(), []);
-  React.useEffect(() => {
-    const t = setInterval(status.reload, 8000);
-    return () => clearInterval(t);
-  }, [status.reload]);
+// CrashLoopBanner surfaces Traefik self-heal recovery to operators. It auto-clears
+// once Traefik is running again. Driven by Shell's shared engine-status poll.
+function CrashLoopBanner({ status: s }: { status: TraefikStatus | null }) {
+  if (!s || !s.crashLoop) return null;
+  return (
+    <div style={{ padding: "12px 16px 0" }}>
+      <Banner kind="danger">
+        <strong>Traefik crash-loop detected.</strong> Auto-respawn was halted after {s.restarts ?? 0} rapid exits;
+        xgress is auto-recovering (clear risky config → roll back to last-known-good → minimal config). This banner
+        clears automatically once Traefik is running again.
+      </Banner>
+    </div>
+  );
+}
 
-  const s = status.data;
+// Compact, always-visible engine state in the top bar — the system's pulse.
+// Driven by Shell's shared engine-status poll.
+function EngineStatus({ status: s }: { status: TraefikStatus | null }) {
   if (!s) return null;
   const color = engineColor(s.state);
   const label = engineLabel(s.state, s.managed);

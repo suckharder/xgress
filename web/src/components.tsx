@@ -32,12 +32,19 @@ export function Field({ label, help, children }: { label: string; help?: string;
 // restore. Children carry their own `.modal-actions` footer (flushed by CSS).
 export function Modal({ title, children, onClose, wide }: { title: string; children: React.ReactNode; onClose: () => void; wide?: boolean }) {
   const ref = React.useRef<HTMLDivElement>(null);
+  // Focus the dialog once when it opens; restore focus on close. Runs once on
+  // mount so a re-render (e.g. a polling page passing a new onClose identity)
+  // can't yank focus back out of an input the user is typing in.
   React.useEffect(() => {
     const prev = document.activeElement as HTMLElement | null;
     ref.current?.focus();
+    return () => prev?.focus?.();
+  }, []);
+  // Escape-to-close. Safe to re-subscribe when onClose changes: no focus side-effect.
+  React.useEffect(() => {
     const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") onClose(); };
     document.addEventListener("keydown", onKey);
-    return () => { document.removeEventListener("keydown", onKey); prev?.focus?.(); };
+    return () => document.removeEventListener("keydown", onKey);
   }, [onClose]);
   return (
     <div className="modal-overlay" onMouseDown={onClose}>

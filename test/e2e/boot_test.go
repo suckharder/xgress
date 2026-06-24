@@ -12,6 +12,7 @@ package e2e
 import (
 	"fmt"
 	"net/http"
+	"net/http/cookiejar"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -37,11 +38,11 @@ func TestCmdBootAndGracefulShutdown(t *testing.T) {
 		"XGRESS_DATA_DIR="+dataDir,
 		"XGRESS_DB_DRIVER=sqlite",
 		"XGRESS_TRAEFIK_MANAGED=false", // supervisor inert → no Traefik binary required
-		"XGRESS_WAF_PRELOAD=false",     // no startup catalog fetch (hermetic)
 		"XGRESS_DEV=true",              // allow plain-HTTP admin cookies
 		"XGRESS_ADMIN_LISTEN="+adminAddr,
 		"XGRESS_PROVIDER_LISTEN="+providerAddr,
 		"XGRESS_EDGE_LISTEN="+edgeAddr,
+		"XGRESS_EDGE_TOKEN=boot-edge-token", // known token so the test can reach the edge
 		"GOCOVERDIR="+covDir,
 	)
 	var logs syncBuffer
@@ -96,6 +97,47 @@ func TestCmdBootAndGracefulShutdown(t *testing.T) {
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusCreated {
 		t.Fatalf("setup = %d, want 201\n--- logs ---\n%s", resp.StatusCode, logs.String())
+	}
+
+	// 4b) Native WAF, hermetically: log in, create a WAF-enabled host, then prove the
+	//     in-process Coraza engine (built into the real binary, no plugin/Docker) blocks
+	//     an attack at the edge. A benign request reaches the proxy (502: no backend).
+	jar, _ := cookiejar.New(nil)
+	authed := &http.Client{Jar: jar, Timeout: 2 * time.Second}
+	if code := postJSON(t, authed, adminBase+"/api/login", `{"email":"admin@boot.test","password":"password123"}`); code != http.StatusOK {
+		t.Fatalf("login = %d, want 200", code)
+	}
+	hostBody := `{"kind":"proxy","enabled":true,"domains":["waf.boot.test"],` +
+		`"upstreams":[{"scheme":"http","host":"127.0.0.1","port":59999}],"tls":"none","waf":true}`
+	if code := postJSON(t, authed, adminBase+"/api/hosts", hostBody); code != http.StatusCreated {
+		t.Fatalf("create waf host = %d, want 201", code)
+	}
+	edgeReq := func(path string) int {
+		req, _ := http.NewRequest(http.MethodGet, "http://"+edgeAddr+path, nil)
+		req.Host = "waf.boot.test"
+		req.Header.Set("X-xgress-Cache-Token", "boot-edge-token")
+		r, err := client.Do(req)
+		if err != nil {
+			return -1
+		}
+		r.Body.Close()
+		return r.StatusCode
+	}
+	// The host index + WAF build land via the reload triggered by the create; poll briefly.
+	deadline := time.Now().Add(10 * time.Second)
+	var attackCode int
+	for time.Now().Before(deadline) {
+		attackCode = edgeReq("/?q=union%20select%201%20from%20users")
+		if attackCode == http.StatusForbidden {
+			break
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	if attackCode != http.StatusForbidden {
+		t.Errorf("native WAF: attack through edge = %d, want 403\n--- logs ---\n%s", attackCode, logs.String())
+	}
+	if benign := edgeReq("/healthz"); benign == http.StatusForbidden {
+		t.Errorf("native WAF: benign request blocked (got 403); should pass to the proxy")
 	}
 
 	// 5) Graceful shutdown: SIGTERM → run() returns nil → process exits 0.

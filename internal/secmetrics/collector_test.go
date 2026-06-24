@@ -62,11 +62,14 @@ func TestCollectorBoundsFlood(t *testing.T) {
 	}
 }
 
-func TestIngestJSONAudit(t *testing.T) {
+func TestRecordAggregates(t *testing.T) {
 	c := New()
-	// A Coraza JSON audit entry for an SQLi block.
-	line := `{"transaction":{"client_ip":"203.0.113.7","request":{"method":"GET","uri":"/?q=1 OR 1=1","headers":{"Host":"app.example.com"}},"response":{"status":403},"is_interrupted":true,"messages":[{"message":"SQL Injection","data":{"id":942100,"msg":"SQL Injection Attack Detected","severity":2,"tags":["attack-sqli","OWASP_CRS"]}}]}}`
-	c.Ingest(line, time.Now())
+	// A native WAF detection for an SQLi block (as the edge would build it).
+	c.Record(Event{
+		ClientIP: "203.0.113.7", Host: "app.example.com", Method: "GET", URI: "/?q=1 OR 1=1",
+		RuleID: "942100", Message: "SQL Injection Attack Detected",
+		Category: Category([]string{"attack-sqli", "OWASP_CRS"}, "SQL Injection"), Severity: 2, Blocked: true,
+	})
 	s := c.Snapshot()
 	if s.Total != 1 || s.Blocked != 1 {
 		t.Fatalf("expected 1 total/blocked, got %d/%d", s.Total, s.Blocked)
@@ -91,17 +94,16 @@ func TestIngestJSONAudit(t *testing.T) {
 	}
 }
 
-func TestIngestTextFallback(t *testing.T) {
+func TestRecordDerivesCategory(t *testing.T) {
 	c := New()
-	line := `Coraza: Warning. detected XSS [id "941100"] [msg "XSS Attack Detected"] [client "198.51.100.4"] [uri "/search?x=<script>"]`
-	c.Ingest(line, time.Now())
-	c.Ingest(`a normal traefik access log line with status 200`, time.Now()) // ignored
+	// No explicit category → derived from the message text.
+	c.Record(Event{ClientIP: "198.51.100.4", RuleID: "941100", Message: "XSS Attack Detected", Blocked: true})
 	s := c.Snapshot()
 	if s.Total != 1 {
-		t.Fatalf("expected 1 event (non-WAF ignored), got %d", s.Total)
+		t.Fatalf("expected 1 event, got %d", s.Total)
 	}
 	if s.TopRules[0].Name != "941100" || s.Categories[0].Name != "xss" || s.TopIPs[0].Name != "198.51.100.4" {
-		t.Errorf("unexpected parse: rule=%v cat=%v ip=%v", s.TopRules, s.Categories, s.TopIPs)
+		t.Errorf("unexpected: rule=%v cat=%v ip=%v", s.TopRules, s.Categories, s.TopIPs)
 	}
 }
 
@@ -109,7 +111,7 @@ func TestObserverDeliveredViaWorker(t *testing.T) {
 	c := New()
 	got := make(chan Event, 4)
 	c.AddObserver(func(e Event) { got <- e })
-	c.Ingest(`[client "1.2.3.4"] Coraza: Access denied (phase 2). [id "942100"] [msg "SQLi"]`, time.Now())
+	c.Record(Event{ClientIP: "1.2.3.4", RuleID: "942100", Message: "SQLi", Blocked: true})
 	select {
 	case e := <-got:
 		if e.ClientIP != "1.2.3.4" || e.RuleID != "942100" {

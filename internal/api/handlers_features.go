@@ -14,6 +14,7 @@ import (
 	"github.com/suckharder/xgress/internal/store"
 	"github.com/suckharder/xgress/internal/traefikapi"
 	"github.com/suckharder/xgress/internal/traefikcfg"
+	"github.com/suckharder/xgress/internal/waf"
 )
 
 // ---------------- Access Lists (#3) + Basic Auth helper (#12) ----------------
@@ -298,33 +299,37 @@ func (s *Server) handleDeleteSchedule(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleGetPlugins(w http.ResponseWriter, r *http.Request) {
 	g := func(k string) string { v, _ := s.store.GetSetting(r.Context(), k); return v }
-	directives := traefikcfg.DefaultWAFDirectives()
+	var directives []string
 	if d := g("plugins.waf.directives"); d != "" {
 		_ = json.Unmarshal([]byte(d), &directives)
 	}
-	ruleset := g("plugins.waf.ruleset")
-	if ruleset == "" {
-		ruleset = "curated"
-	}
-	// WAF is preloaded (opt-out): enabled unless explicitly turned off.
-	wafEnabled := s.cfg.WAFPreload
-	if v, err := s.store.GetSetting(r.Context(), "plugins.waf.enabled"); err == nil {
+	// WAF default is opt-out (native engine is always in the binary).
+	wafEnabled := s.cfg.WAFDefaultEnabled
+	if v := g("plugins.waf.enabled"); v != "" {
 		wafEnabled = v == "true" || v == "1"
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"wafEnabled":    wafEnabled,
-		"wafRuleset":    ruleset,
+		"wafParanoia":   intSetting(g("plugins.waf.paranoia"), waf.DefaultParanoiaLevel),
+		"wafAnomaly":    intSetting(g("plugins.waf.anomaly"), waf.DefaultAnomalyThreshold),
 		"wafDirectives": directives,
-		"wafModule":     traefikcfg.WAFModuleName + " " + traefikcfg.WAFModuleVersion,
 		"cacheEnabled":  g("plugins.cache.enabled") == "true",
 		"cacheBackend":  s.engine.CacheBackendName(),
 	})
 }
 
+func intSetting(v string, def int) int {
+	if n, err := strconv.Atoi(v); err == nil && n > 0 {
+		return n
+	}
+	return def
+}
+
 func (s *Server) handleSetPlugins(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		WAFEnabled    bool     `json:"wafEnabled"`
-		WAFRuleset    string   `json:"wafRuleset"`
+		WAFParanoia   int      `json:"wafParanoia"`
+		WAFAnomaly    int      `json:"wafAnomaly"`
 		WAFDirectives []string `json:"wafDirectives"`
 		CacheEnabled  bool     `json:"cacheEnabled"`
 	}
@@ -332,22 +337,32 @@ func (s *Server) handleSetPlugins(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "invalid body")
 		return
 	}
+	// Validate the requested ruleset BEFORE persisting so a bad custom directive
+	// can't poison the stored setting (which would then fail every future rebuild).
+	if _, err := waf.Build(waf.Options{
+		ParanoiaLevel: req.WAFParanoia, AnomalyThreshold: req.WAFAnomaly, Extra: req.WAFDirectives,
+	}, nil); err != nil {
+		writeErr(w, http.StatusUnprocessableEntity, "WAF rules invalid: "+err.Error())
+		return
+	}
 	set := func(k, v string) { _ = s.store.SetSetting(r.Context(), k, v) }
 	set("plugins.waf.enabled", boolStr(req.WAFEnabled))
-	if req.WAFRuleset != "" {
-		set("plugins.waf.ruleset", req.WAFRuleset)
+	if req.WAFParanoia > 0 {
+		set("plugins.waf.paranoia", strconv.Itoa(req.WAFParanoia))
+	}
+	if req.WAFAnomaly > 0 {
+		set("plugins.waf.anomaly", strconv.Itoa(req.WAFAnomaly))
 	}
 	set("plugins.cache.enabled", boolStr(req.CacheEnabled))
 	if req.WAFDirectives != nil {
 		b, _ := json.Marshal(req.WAFDirectives)
 		set("plugins.waf.directives", string(b))
 	}
-	// Enabling/disabling the WAF changes static config → write it and restart
-	// Traefik (it loads/unloads the plugin at startup). The native cache toggle
-	// is a pure dynamic-config change (no restart) but SyncStatic is a no-op when
-	// nothing changed.
-	if err := s.engine.SyncStatic(r.Context(), false); err != nil {
-		writeErr(w, http.StatusInternalServerError, "saved but restart failed: "+err.Error())
+	// The WAF is in-process now: toggling it (and changing rules) is a pure
+	// dynamic-config change — rebuild the engine and hot-reload; no Traefik restart,
+	// no plugin load, no static-config change.
+	if err := s.engine.RebuildWAF(r.Context()); err != nil {
+		writeErr(w, http.StatusInternalServerError, "saved but WAF rebuild failed: "+err.Error())
 		return
 	}
 	_ = s.reloadAfterChange(r.Context())

@@ -2,13 +2,25 @@ package store
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"errors"
 	"time"
 )
 
 // ErrNotFound is returned when a lookup matches no row.
 var ErrNotFound = errors.New("not found")
+
+// hashSessionToken maps a session token to its at-rest representation. Sessions are
+// stored as sha256(token), never the live token, so a database read (backup, file
+// access, SQLi elsewhere) cannot hand out usable sessions (S7). The token stays in
+// the cookie; the DB only ever holds its hash. sha256 is sufficient here — the token
+// is 256 bits of CSPRNG output, not a low-entropy secret needing a slow KDF.
+func hashSessionToken(token string) string {
+	sum := sha256.Sum256([]byte(token))
+	return hex.EncodeToString(sum[:])
+}
 
 // CountUsers returns how many user accounts exist (used to detect first-run).
 func (s *Store) CountUsers(ctx context.Context) (int, error) {
@@ -129,29 +141,32 @@ func (s *Store) DeleteUser(ctx context.Context, id string) error {
 
 // --- sessions ---
 
-// CreateSession stores a login session.
+// CreateSession stores a login session. Only the token's hash is persisted (S7);
+// sess.Token is left untouched so the caller can still set it as the cookie value.
 func (s *Store) CreateSession(ctx context.Context, sess *Session) error {
 	_, err := s.exec(ctx,
 		`INSERT INTO sessions (token,user_id,user_agent,ip,created_at,expires_at) VALUES (?,?,?,?,?,?)`,
-		sess.Token, sess.UserID, sess.UserAgent, sess.IP, sess.CreatedAt.Unix(), sess.ExpiresAt.Unix())
+		hashSessionToken(sess.Token), sess.UserID, sess.UserAgent, sess.IP, sess.CreatedAt.Unix(), sess.ExpiresAt.Unix())
 	return err
 }
 
-// GetSession fetches a non-expired session and its user.
+// GetSession fetches a non-expired session by its token (looked up by hash).
 func (s *Store) GetSession(ctx context.Context, token string) (*Session, error) {
 	var (
 		sess             Session
+		stored           string
 		created, expires int64
 	)
 	err := s.queryRow(ctx,
-		`SELECT token,user_id,user_agent,ip,created_at,expires_at FROM sessions WHERE token = ?`, token).
-		Scan(&sess.Token, &sess.UserID, &sess.UserAgent, &sess.IP, &created, &expires)
+		`SELECT token,user_id,user_agent,ip,created_at,expires_at FROM sessions WHERE token = ?`, hashSessionToken(token)).
+		Scan(&stored, &sess.UserID, &sess.UserAgent, &sess.IP, &created, &expires)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
 	if err != nil {
 		return nil, err
 	}
+	sess.Token = token // return the live token the caller supplied, not its stored hash
 	sess.CreatedAt = time.Unix(created, 0).UTC()
 	sess.ExpiresAt = time.Unix(expires, 0).UTC()
 	if time.Now().After(sess.ExpiresAt) {
@@ -163,7 +178,7 @@ func (s *Store) GetSession(ctx context.Context, token string) (*Session, error) 
 
 // DeleteSession revokes a session.
 func (s *Store) DeleteSession(ctx context.Context, token string) error {
-	_, err := s.exec(ctx, `DELETE FROM sessions WHERE token = ?`, token)
+	_, err := s.exec(ctx, `DELETE FROM sessions WHERE token = ?`, hashSessionToken(token))
 	return err
 }
 

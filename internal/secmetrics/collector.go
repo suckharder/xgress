@@ -1,16 +1,13 @@
-// Package secmetrics turns the Coraza WAF's log output (captured from Traefik's
-// stdout by the supervisor) into security metrics: blocked-request counts, top
-// triggered rules, attack categories, source IPs, per-host totals, a time
-// series, and a recent-events feed. The parser is tolerant of both the Coraza
-// JSON audit format and ModSecurity-style `[id "…"][msg "…"]` text, because the
-// JSON format is not always honoured by the WASM build.
+// Package secmetrics turns native Coraza WAF detections into security metrics:
+// blocked-request counts, top triggered rules, attack categories, source IPs,
+// per-host totals, a time series, and a recent-events feed. Events are recorded
+// directly from the in-process WAF (internal/edge builds them from a
+// transaction's matched rules), so they carry the real rule id, message,
+// severity, category, host, method, and client IP — no log parsing.
 package secmetrics
 
 import (
-	"encoding/json"
-	"regexp"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -109,138 +106,23 @@ func (c *Collector) runObservers() {
 	}
 }
 
-var (
-	reID   = regexp.MustCompile(`\[id "(\d+)"\]`)
-	reMsg  = regexp.MustCompile(`\[msg "([^"]*)"\]`)
-	reIP   = regexp.MustCompile(`\[client "?([0-9a-fA-F:.]+)`)
-	reURI  = regexp.MustCompile(`\[uri "([^"]*)"\]`)
-	reHost = regexp.MustCompile(`\[hostname "([^"]+)"\]`)
-)
-
-// Ingest parses a single captured log line. Non-WAF lines are ignored cheaply.
-func (c *Collector) Ingest(raw string, at time.Time) {
-	if at.IsZero() {
-		at = time.Now()
+// Record ingests one WAF detection straight from the in-process engine. It is
+// the native replacement for the old log-parsing Ingest: internal/edge builds an
+// Event per matched rule (with the real rule id, severity, tags, host, method,
+// and client IP) and hands it here. A zero At is stamped now.
+func (c *Collector) Record(e Event) {
+	if e.At.IsZero() {
+		e.At = time.Now()
 	}
-	// Cheap prefilter: only lines that look like Coraza audit/error output.
-	jsonish := strings.Contains(raw, `"transaction"`) || strings.Contains(raw, `"messages"`)
-	textish := strings.Contains(raw, `[id "`)
-	if !jsonish && !textish {
-		return
+	if e.Category == "" {
+		e.Category = category(nil, e.Message)
 	}
-	if jsonish {
-		if evs, ok := parseJSON(raw, at); ok {
-			for _, e := range evs {
-				c.add(e)
-			}
-			return
-		}
-	}
-	if textish {
-		if e, ok := parseText(raw, at); ok {
-			c.add(e)
-		}
-	}
+	c.add(e)
 }
 
-// parseJSON parses a Coraza JSON audit entry into one event per matched rule.
-func parseJSON(raw string, at time.Time) ([]Event, bool) {
-	i := strings.IndexByte(raw, '{')
-	if i < 0 {
-		return nil, false
-	}
-	var doc struct {
-		Transaction struct {
-			ClientIP string `json:"client_ip"`
-			Request  struct {
-				Method  string          `json:"method"`
-				URI     string          `json:"uri"`
-				Headers json.RawMessage `json:"headers"`
-			} `json:"request"`
-			Response struct {
-				Status int `json:"status"`
-			} `json:"response"`
-			IsInterrupted bool `json:"is_interrupted"`
-			Messages      []struct {
-				Message string `json:"message"`
-				Data    struct {
-					ID       int      `json:"id"`
-					Msg      string   `json:"msg"`
-					Severity int      `json:"severity"`
-					Tags     []string `json:"tags"`
-				} `json:"data"`
-			} `json:"messages"`
-		} `json:"transaction"`
-	}
-	if err := json.Unmarshal([]byte(raw[i:]), &doc); err != nil {
-		return nil, false
-	}
-	t := doc.Transaction
-	if len(t.Messages) == 0 {
-		return nil, false
-	}
-	host := hostFromHeaders(t.Request.Headers)
-	blocked := t.IsInterrupted || t.Response.Status == 403
-	var out []Event
-	for _, m := range t.Messages {
-		msg := m.Data.Msg
-		if msg == "" {
-			msg = m.Message
-		}
-		out = append(out, Event{
-			At: at, ClientIP: t.ClientIP, Host: host, Method: t.Request.Method, URI: t.Request.URI,
-			RuleID: strconv.Itoa(m.Data.ID), Message: msg, Category: category(m.Data.Tags, msg),
-			Severity: m.Data.Severity, Blocked: blocked,
-		})
-	}
-	return out, true
-}
-
-func hostFromHeaders(raw json.RawMessage) string {
-	if len(raw) == 0 {
-		return ""
-	}
-	// Headers may be map[string]string or map[string][]string.
-	var asStr map[string]string
-	if json.Unmarshal(raw, &asStr) == nil {
-		for k, v := range asStr {
-			if strings.EqualFold(k, "host") {
-				return v
-			}
-		}
-	}
-	var asArr map[string][]string
-	if json.Unmarshal(raw, &asArr) == nil {
-		for k, v := range asArr {
-			if strings.EqualFold(k, "host") && len(v) > 0 {
-				return v[0]
-			}
-		}
-	}
-	return ""
-}
-
-func parseText(raw string, at time.Time) (Event, bool) {
-	id := reID.FindStringSubmatch(raw)
-	if id == nil {
-		return Event{}, false
-	}
-	e := Event{At: at, RuleID: id[1], Blocked: true}
-	if m := reMsg.FindStringSubmatch(raw); m != nil {
-		e.Message = m[1]
-	}
-	if m := reIP.FindStringSubmatch(raw); m != nil {
-		e.ClientIP = m[1]
-	}
-	if m := reURI.FindStringSubmatch(raw); m != nil {
-		e.URI = m[1]
-	}
-	if m := reHost.FindStringSubmatch(raw); m != nil {
-		e.Host = m[1]
-	}
-	e.Category = category(nil, e.Message)
-	return e, true
-}
+// Category derives a friendly attack category from CRS tags (e.g. "attack-sqli")
+// or, failing that, the rule message. Exported so the edge can label events.
+func Category(tags []string, msg string) string { return category(tags, msg) }
 
 // category derives a friendly attack category from CRS tags or the message text.
 func category(tags []string, msg string) string {
