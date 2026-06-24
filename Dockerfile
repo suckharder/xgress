@@ -32,7 +32,7 @@ RUN --mount=type=cache,target=/go/pkg/mod go mod download
 COPY . .
 # Inject the freshly built SPA so go:embed picks it up.
 COPY --from=web /web/dist ./web/dist
-ARG VERSION=0.9.0-rc.1
+ARG VERSION=0.10.0
 ARG COMMIT=docker
 # Cache mounts make rebuilds fast (the lego/cloud-SDK tree is large to compile cold).
 RUN --mount=type=cache,target=/go/pkg/mod \
